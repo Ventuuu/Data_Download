@@ -148,56 +148,54 @@ def process_bin_file(bin_filename, csv_filename=None):
     })
 
     # ---- Visualization ----
-    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
+    fig, axes = plt.subplots(6, 1, figsize=(15, 16), sharex=True)
 
-    # Accelerometer
-    axes[0].plot(df.index, df["acc_x"], label="acc_x")
-    axes[0].plot(df.index, df["acc_y"], label="acc_y")
-    axes[0].plot(df.index, df["acc_z"], label="acc_z")
-    axes[0].set_title("Accelerometer")
+    # Accelerometer (one axis per subplot row)
+    axes[0].plot(df.index, df["acc_x"], color="C0")
+    axes[0].set_title("Accelerometer X")
     axes[0].set_ylabel("g")
-    axes[0].legend()
     axes[0].grid(True)
 
-    # Gyroscope
-    axes[1].plot(df.index, df["gyro_x"], label="gyro_x")
-    axes[1].plot(df.index, df["gyro_y"], label="gyro_y")
-    axes[1].plot(df.index, df["gyro_z"], label="gyro_z")
-    axes[1].set_title("Gyroscope")
-    axes[1].set_ylabel("deg/s")
-    axes[1].legend()
+    axes[1].plot(df.index, df["acc_y"], color="C1")
+    axes[1].set_title("Accelerometer Y")
+    axes[1].set_ylabel("g")
     axes[1].grid(True)
 
-    # Light: Clear/NIR and mains category
-    axes[2].plot(df.index, df["clear"], label="Clear")
-    axes[2].plot(df.index, df["nir"], label="NIR")
-
-    # Overlay mains category as coloured background stripes
-    unique_categories = df["mains_category"].unique()
-    colors = {
-        "no mains / natural": "#e0e0e0",
-        "50 Hz mains": "#ffcccc",
-        "60 Hz mains": "#cce5ff",
-    }
-    last_cat = None
-    start_idx = 0
-    for idx, cat in enumerate(df["mains_category"]):
-        if last_cat is None:
-            last_cat = cat
-            start_idx = idx
-        elif cat != last_cat:
-            axes[2].axvspan(start_idx, idx, color=colors.get(last_cat, "#ffffff"), alpha=0.2)
-            last_cat = cat
-            start_idx = idx
-    # close last span
-    if last_cat is not None and len(df) > 0:
-        axes[2].axvspan(start_idx, len(df), color=colors.get(last_cat, "#ffffff"), alpha=0.2)
-
-    axes[2].set_title("Light (Clear/NIR) with mains category")
-    axes[2].set_xlabel("Sample index")
-    axes[2].set_ylabel("counts")
-    axes[2].legend()
+    axes[2].plot(df.index, df["acc_z"], color="C2")
+    axes[2].set_title("Accelerometer Z")
+    axes[2].set_ylabel("g")
     axes[2].grid(True)
+
+    # Gyroscope (one combined plot for 3 axes)
+    axes[3].plot(df.index, df["gyro_x"], label="gyro_x")
+    axes[3].plot(df.index, df["gyro_y"], label="gyro_y")
+    axes[3].plot(df.index, df["gyro_z"], label="gyro_z")
+    axes[3].set_title("Gyroscope")
+    axes[3].set_ylabel("deg/s")
+    axes[3].legend()
+    axes[3].grid(True)
+
+    # Light: Clear and NIR in their own subplot
+    axes[4].plot(df.index, df["clear"], label="Clear")
+    axes[4].plot(df.index, df["nir"], label="NIR")
+    axes[4].set_title("Light (Clear/NIR)")
+    axes[4].set_ylabel("counts")
+    axes[4].legend()
+    axes[4].grid(True)
+
+    # Mains category as a categorical track
+    category_to_level = {
+        "no mains / natural": 0,
+        "50 Hz mains": 1,
+        "60 Hz mains": 2,
+    }
+    levels = [category_to_level[c] for c in df["mains_category"]]
+    axes[5].step(df.index, levels, where="post")
+    axes[5].set_yticks(list(category_to_level.values()))
+    axes[5].set_yticklabels(list(category_to_level.keys()))
+    axes[5].set_title("Mains category")
+    axes[5].set_xlabel("Sample index")
+    axes[5].grid(True)
 
     plt.tight_layout()
     plt.show()

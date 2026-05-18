@@ -7,23 +7,29 @@ from datetime import datetime
 from tkinter import Tk, filedialog, ttk, messagebox, StringVar, Label, Button
 from serial.tools import list_ports
 
+BYTES_PER_SAMPLE = 37  # must match firmware's BYTES_PER_SAMPLE
+
+
 def convert_16bit_signed(lo, hi):
     combined = (hi.astype(np.uint16) << 8) | lo.astype(np.uint16)
     return combined.view(np.int16)
 
+
 def conv_imu(arr):
-    x = convert_16bit_signed(arr[:,0], arr[:,1])# / (2**15) * 2
-    y = convert_16bit_signed(arr[:,2], arr[:,3])# / (2**15) * 2
-    z = convert_16bit_signed(arr[:,4], arr[:,5])# / (2**15) * 2
+    x = convert_16bit_signed(arr[:, 0], arr[:, 1])
+    y = convert_16bit_signed(arr[:, 2], arr[:, 3])
+    z = convert_16bit_signed(arr[:, 4], arr[:, 5])
     return x, y, z
+
 
 def conv_gyro(arr):
-    x = convert_16bit_signed(arr[:,0], arr[:,1])# / (2**15) * 250
-    y = convert_16bit_signed(arr[:,2], arr[:,3])# / (2**15) * 250
-    z = convert_16bit_signed(arr[:,4], arr[:,5])# / (2**15) * 250
+    x = convert_16bit_signed(arr[:, 0], arr[:, 1])
+    y = convert_16bit_signed(arr[:, 2], arr[:, 3])
+    z = convert_16bit_signed(arr[:, 4], arr[:, 5])
     return x, y, z
 
-def receive_and_save_data(ser, bin_filename, packet_size=4096, max_packets=2048*64):
+
+def receive_and_save_data(ser, bin_filename, packet_size=4096, max_packets=2048 * 64):
     """Riceve pacchetti via seriale e li salva in binario."""
     with open(bin_filename, 'wb') as f:
         for packet_count in range(max_packets):
@@ -34,27 +40,36 @@ def receive_and_save_data(ser, bin_filename, packet_size=4096, max_packets=2048*
                 print("Received Terminator Character.")
                 break
             f.write(data)
-            print(f"📥 Received packet {packet_count+1}")
+            print(f"📥 Received packet {packet_count + 1}")
     ser.close()
     print("📴 Serial COM Port Closed.")
 
+
 def process_bin_file(bin_filename, csv_filename=None):
+    # lists for timestamp and IMU
     hh_list, mm_list, ss_list, sss_list = [], [], [], []
     acc_x_list, acc_y_list, acc_z_list = [], [], []
     gyro_x_list, gyro_y_list, gyro_z_list = [], [], []
+
+    # lists for light data
+    f1_list, f2_list, f3_list, f4_list = [], [], [], []
+    clear_list, nir_list = [], []
+    mains_hz_list = []
+    mains_category_list = []
 
     with open(bin_filename, "rb") as f:
         while True:
             pagina = f.read(4096)
             if len(pagina) < 4096:
                 break
-            # considera solo i primi 4080 byte (4096 - 16 finali inutili)
+
             valid_bytes = pagina[:4080]
-            # ogni sottopacchetto 17 byte
-            for i in range(0, len(valid_bytes), 17):
-                subpkt = valid_bytes[i:i+17]
-                if len(subpkt) < 17:
+
+            for i in range(0, len(valid_bytes), BYTES_PER_SAMPLE):
+                subpkt = valid_bytes[i:i + BYTES_PER_SAMPLE]
+                if len(subpkt) < BYTES_PER_SAMPLE:
                     continue
+
                 # timestamp
                 hh = subpkt[0]
                 mm = subpkt[1]
@@ -64,18 +79,18 @@ def process_bin_file(bin_filename, csv_filename=None):
                 mm_list.append(mm)
                 ss_list.append(ss)
                 sss_list.append(sss)
-                # dati IMU
-                imu_bytes = np.frombuffer(subpkt[5:], dtype=np.uint8).reshape(2,6)
-                # prima 6 byte = accelerometro
-                acc_arr = np.frombuffer(subpkt[5:11], dtype=np.uint8).reshape(1,6)
+
+                # IMU raw bytes
+                acc_arr = np.frombuffer(subpkt[5:11], dtype=np.uint8).reshape(1, 6)
+                gyro_arr = np.frombuffer(subpkt[11:17], dtype=np.uint8).reshape(1, 6)
+
                 acc_x, acc_y, acc_z = conv_imu(acc_arr)
-                # successivi 6 byte = giroscopio
-                gyro_arr = np.frombuffer(subpkt[11:17], dtype=np.uint8).reshape(1,6)
                 gx, gy, gz = conv_gyro(gyro_arr)
 
-                # modified data-graphs association
+                # sensitivities (same mapping hack as original script)
                 a_sensitivity = 2.0 / 32767.0
                 g_sensitivity = 1.0 / 175.0
+
                 acc_x_list.append(gx[0] * a_sensitivity)
                 acc_y_list.append(gy[0] * a_sensitivity)
                 acc_z_list.append(gz[0] * a_sensitivity)
@@ -83,16 +98,34 @@ def process_bin_file(bin_filename, csv_filename=None):
                 gyro_y_list.append(acc_y[0] * g_sensitivity)
                 gyro_z_list.append(acc_z[0] * g_sensitivity)
 
-                """
-                acc_x_list.append(acc_x[0])
-                acc_y_list.append(acc_y[0])
-                acc_z_list.append(acc_z[0])
-                gyro_x_list.append(gx[0])
-                gyro_y_list.append(gy[0])
-                gyro_z_list.append(gz[0])
-                """
+                # ---- Light data decoding ----
+                # Filters F1..F4 (4 × uint16) are at bytes 17..24
+                f1 = subpkt[17] | (subpkt[18] << 8)
+                f2 = subpkt[19] | (subpkt[20] << 8)
+                f3 = subpkt[21] | (subpkt[22] << 8)
+                f4 = subpkt[23] | (subpkt[24] << 8)
+                f1_list.append(f1)
+                f2_list.append(f2)
+                f3_list.append(f3)
+                f4_list.append(f4)
 
-    # crea DataFrame
+                # Clear and NIR
+                clear = subpkt[25] | (subpkt[26] << 8)
+                nir = subpkt[27] | (subpkt[28] << 8)
+                clear_list.append(clear)
+                nir_list.append(nir)
+
+                # Flicker / mains frequency (0, 50, 60)
+                mains_hz = subpkt[29] | (subpkt[30] << 8)
+                mains_hz_list.append(mains_hz)
+
+                if mains_hz == 50:
+                    mains_category_list.append("50 Hz mains")
+                elif mains_hz == 60:
+                    mains_category_list.append("60 Hz mains")
+                else:
+                    mains_category_list.append("no mains / natural")
+
     df = pd.DataFrame({
         "hh": hh_list,
         "mm": mm_list,
@@ -103,38 +136,76 @@ def process_bin_file(bin_filename, csv_filename=None):
         "acc_z": acc_z_list,
         "gyro_x": gyro_x_list,
         "gyro_y": gyro_y_list,
-        "gyro_z": gyro_z_list
+        "gyro_z": gyro_z_list,
+        "f1": f1_list,
+        "f2": f2_list,
+        "f3": f3_list,
+        "f4": f4_list,
+        "clear": clear_list,
+        "nir": nir_list,
+        "mains_hz": mains_hz_list,
+        "mains_category": mains_category_list,
     })
 
-    # plot accelerometro
-    plt.figure(figsize=(15,5))
-    plt.subplot(2,1,1)
-    plt.plot(df.index, df["acc_x"], label="acc_x")
-    plt.plot(df.index, df["acc_y"], label="acc_y")
-    plt.plot(df.index, df["acc_z"], label="acc_z")
-    plt.title("Accelerometer")
-    plt.xlabel("Subpacket index")
-    plt.ylabel("g")
-    plt.legend()
-    plt.grid(True)
+    # ---- Visualization ----
+    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
 
-    # plot giroscopio
-    plt.subplot(2,1,2)
-    plt.plot(df.index, df["gyro_x"], label="gyro_x")
-    plt.plot(df.index, df["gyro_y"], label="gyro_y")
-    plt.plot(df.index, df["gyro_z"], label="gyro_z")
-    plt.title("Gyroscope")
-    plt.xlabel("Subpacket index")
-    plt.ylabel("deg/s")
-    plt.legend()
-    plt.grid(True)
+    # Accelerometer
+    axes[0].plot(df.index, df["acc_x"], label="acc_x")
+    axes[0].plot(df.index, df["acc_y"], label="acc_y")
+    axes[0].plot(df.index, df["acc_z"], label="acc_z")
+    axes[0].set_title("Accelerometer")
+    axes[0].set_ylabel("g")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # Gyroscope
+    axes[1].plot(df.index, df["gyro_x"], label="gyro_x")
+    axes[1].plot(df.index, df["gyro_y"], label="gyro_y")
+    axes[1].plot(df.index, df["gyro_z"], label="gyro_z")
+    axes[1].set_title("Gyroscope")
+    axes[1].set_ylabel("deg/s")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    # Light: Clear/NIR and mains category
+    axes[2].plot(df.index, df["clear"], label="Clear")
+    axes[2].plot(df.index, df["nir"], label="NIR")
+
+    # Overlay mains category as coloured background stripes
+    unique_categories = df["mains_category"].unique()
+    colors = {
+        "no mains / natural": "#e0e0e0",
+        "50 Hz mains": "#ffcccc",
+        "60 Hz mains": "#cce5ff",
+    }
+    last_cat = None
+    start_idx = 0
+    for idx, cat in enumerate(df["mains_category"]):
+        if last_cat is None:
+            last_cat = cat
+            start_idx = idx
+        elif cat != last_cat:
+            axes[2].axvspan(start_idx, idx, color=colors.get(last_cat, "#ffffff"), alpha=0.2)
+            last_cat = cat
+            start_idx = idx
+    # close last span
+    if last_cat is not None and len(df) > 0:
+        axes[2].axvspan(start_idx, len(df), color=colors.get(last_cat, "#ffffff"), alpha=0.2)
+
+    axes[2].set_title("Light (Clear/NIR) with mains category")
+    axes[2].set_xlabel("Sample index")
+    axes[2].set_ylabel("counts")
+    axes[2].legend()
+    axes[2].grid(True)
+
     plt.tight_layout()
     plt.show()
 
-    # salva CSV
     if csv_filename:
         df.to_csv(csv_filename, index=False)
         print(f"📄 Data saved in CSV: {csv_filename}")
+
 
 def gui_select_com_and_folder():
     """Apre una piccola GUI per selezionare COM e cartella."""
@@ -144,7 +215,7 @@ def gui_select_com_and_folder():
     root.resizable(False, False)
 
     Label(root, text="🔌 Select the COM Port:", font=("Segoe UI", 10)).pack(pady=5)
-    
+
     com_var = StringVar()
     ports = [p.device for p in list_ports.comports()]
 
@@ -159,7 +230,7 @@ def gui_select_com_and_folder():
         if folder:
             folder_var.set(folder)
 
-    folder_var =StringVar()
+    folder_var = StringVar()
     Label(root, text="📁 Folder:", font=("Segoe UI", 10)).pack(pady=5)
     Button(root, text="Select folder...", command=browse_folder).pack()
     Label(root, textvariable="folder_var", fg="blue", wraplength=350).pack(pady=5)
@@ -175,9 +246,6 @@ def gui_select_com_and_folder():
 
     return com_var.get(), folder_var.get()
 
-# ==============================
-# Main
-# ==============================
 
 def main():
     com_port, save_path = gui_select_com_and_folder()
@@ -187,7 +255,7 @@ def main():
 
     base_filename = datetime.now().strftime("IMUData_%Y%m%d_%H%M%S")
     bin_filename = os.path.join(save_path, f"{base_filename}.bin")
-    csv_filename = os.path.join(save_path, f"{base_filename}_imu.csv")
+    csv_filename = os.path.join(save_path, f"{base_filename}_imu_light.csv")
 
     BAUD_RATE = 250000
 
@@ -201,9 +269,6 @@ def main():
 
     process_bin_file(bin_filename, csv_filename)
 
-# ==============================
-# Entry point
-# ==============================
 
 if __name__ == "__main__":
     main()

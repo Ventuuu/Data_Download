@@ -9,6 +9,12 @@ from serial.tools import list_ports
 
 BYTES_PER_SAMPLE = 40  # must match firmware's BYTES_PER_SAMPLE / STRIDE_BYTES_PER_SAMPLE
 
+# ATTENTION: ???????????
+# This script now reads the 7 colours (F1..F8 + clear + NIR + mains) and plots them in separate subplots, along with the IMU data. 
+# The mains frequency is categorized and plotted as a categorical track.
+# Don't forget to re-upload the Imu-logger to the mcu before running this script. (latest change 18/05/2026)
+# Because now the script reads 40 bytes per sample instead of 32, 
+# the script will read junk data if the firmware is not updated first.
 
 def convert_16bit_signed(lo, hi):
     combined = (hi.astype(np.uint16) << 8) | lo.astype(np.uint16)

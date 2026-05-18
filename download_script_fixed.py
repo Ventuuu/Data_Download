@@ -7,7 +7,7 @@ from datetime import datetime
 from tkinter import Tk, filedialog, ttk, messagebox, StringVar, Label, Button
 from serial.tools import list_ports
 
-BYTES_PER_SAMPLE = 37  # must match firmware's BYTES_PER_SAMPLE
+BYTES_PER_SAMPLE = 40  # must match firmware's BYTES_PER_SAMPLE / STRIDE_BYTES_PER_SAMPLE
 
 
 def convert_16bit_signed(lo, hi):
@@ -53,6 +53,7 @@ def process_bin_file(bin_filename, csv_filename=None):
 
     # lists for light data
     f1_list, f2_list, f3_list, f4_list = [], [], [], []
+    f5_list, f6_list, f7_list, f8_list = [], [], [], []
     clear_list, nir_list = [], []
     mains_hz_list = []
     mains_category_list = []
@@ -99,24 +100,32 @@ def process_bin_file(bin_filename, csv_filename=None):
                 gyro_z_list.append(acc_z[0] * g_sensitivity)
 
                 # ---- Light data decoding ----
-                # Filters F1..F4 (4 × uint16) are at bytes 17..24
+                # Filters F1..F8 (8 × uint16) are at bytes 17..32
                 f1 = subpkt[17] | (subpkt[18] << 8)
                 f2 = subpkt[19] | (subpkt[20] << 8)
                 f3 = subpkt[21] | (subpkt[22] << 8)
                 f4 = subpkt[23] | (subpkt[24] << 8)
+                f5 = subpkt[25] | (subpkt[26] << 8)
+                f6 = subpkt[27] | (subpkt[28] << 8)
+                f7 = subpkt[29] | (subpkt[30] << 8)
+                f8 = subpkt[31] | (subpkt[32] << 8)
                 f1_list.append(f1)
                 f2_list.append(f2)
                 f3_list.append(f3)
                 f4_list.append(f4)
+                f5_list.append(f5)
+                f6_list.append(f6)
+                f7_list.append(f7)
+                f8_list.append(f8)
 
                 # Clear and NIR
-                clear = subpkt[25] | (subpkt[26] << 8)
-                nir = subpkt[27] | (subpkt[28] << 8)
+                clear = subpkt[33] | (subpkt[34] << 8)
+                nir = subpkt[35] | (subpkt[36] << 8)
                 clear_list.append(clear)
                 nir_list.append(nir)
 
                 # Flicker / mains frequency (0, 50, 60)
-                mains_hz = subpkt[29] | (subpkt[30] << 8)
+                mains_hz = subpkt[37] | (subpkt[38] << 8)
                 mains_hz_list.append(mains_hz)
 
                 if mains_hz == 50:
@@ -141,6 +150,10 @@ def process_bin_file(bin_filename, csv_filename=None):
         "f2": f2_list,
         "f3": f3_list,
         "f4": f4_list,
+        "f5": f5_list,
+        "f6": f6_list,
+        "f7": f7_list,
+        "f8": f8_list,
         "clear": clear_list,
         "nir": nir_list,
         "mains_hz": mains_hz_list,
@@ -157,9 +170,13 @@ def process_bin_file(bin_filename, csv_filename=None):
     #  5: F2
     #  6: F3
     #  7: F4
-    #  8: NIR
-    #  9: mains category
-    fig, axes = plt.subplots(10, 1, figsize=(15, 20), sharex=True)
+    #  8: F5
+    #  9: F6
+    # 10: F7
+    # 11: F8
+    # 12: NIR
+    # 13: mains category
+    fig, axes = plt.subplots(14, 1, figsize=(15, 26), sharex=True)
 
     # Accelerometer (one axis per subplot row)
     axes[0].plot(df.index, df["acc_x"], color="C0")
@@ -207,11 +224,31 @@ def process_bin_file(bin_filename, csv_filename=None):
     axes[7].set_ylabel("counts")
     axes[7].grid(True)
 
-    # NIR alone
-    axes[8].plot(df.index, df["nir"], color="C7")
-    axes[8].set_title("NIR channel")
+    axes[8].plot(df.index, df["f5"], color="C7")
+    axes[8].set_title("Light filter F5")
     axes[8].set_ylabel("counts")
     axes[8].grid(True)
+
+    axes[9].plot(df.index, df["f6"], color="C8")
+    axes[9].set_title("Light filter F6")
+    axes[9].set_ylabel("counts")
+    axes[9].grid(True)
+
+    axes[10].plot(df.index, df["f7"], color="C9")
+    axes[10].set_title("Light filter F7")
+    axes[10].set_ylabel("counts")
+    axes[10].grid(True)
+
+    axes[11].plot(df.index, df["f8"], color="C1")
+    axes[11].set_title("Light filter F8")
+    axes[11].set_ylabel("counts")
+    axes[11].grid(True)
+
+    # NIR alone
+    axes[12].plot(df.index, df["nir"], color="C2")
+    axes[12].set_title("NIR channel")
+    axes[12].set_ylabel("counts")
+    axes[12].grid(True)
 
     # Mains category as a categorical track
     category_to_level = {
@@ -220,12 +257,12 @@ def process_bin_file(bin_filename, csv_filename=None):
         "60 Hz mains": 2,
     }
     levels = [category_to_level[c] for c in df["mains_category"]]
-    axes[9].step(df.index, levels, where="post")
-    axes[9].set_yticks(list(category_to_level.values()))
-    axes[9].set_yticklabels(list(category_to_level.keys()))
-    axes[9].set_title("Mains category")
-    axes[9].set_xlabel("Sample index")
-    axes[9].grid(True)
+    axes[13].step(df.index, levels, where="post")
+    axes[13].set_yticks(list(category_to_level.values()))
+    axes[13].set_yticklabels(list(category_to_level.keys()))
+    axes[13].set_title("Mains category")
+    axes[13].set_xlabel("Sample index")
+    axes[13].grid(True)
 
     plt.tight_layout()
     plt.show()

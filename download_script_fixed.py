@@ -185,76 +185,69 @@ def process_bin_file(bin_filename, csv_filename=None):
     fig, axes = plt.subplots(14, 1, figsize=(15, 26), sharex=True)
 
     # Accelerometer (one axis per subplot row)
-    axes[0].plot(df.index, df["acc_x"], color="C0")
-    axes[0].set_title("Accelerometer X")
+    axes[0].plot(df.index, df["acc_x"], Label = "acc_x")
+    axes[0].plot(df.index, df["acc_y"], Label = "acc_y")
+    axes[0].plot(df.index, df["acc_z"], Label = "acc_z")
+    axes[0].set_title("Accelerometer")
     axes[0].set_ylabel("g")
-    axes[0].grid(True)
-
-    axes[1].plot(df.index, df["acc_y"], color="C1")
-    axes[1].set_title("Accelerometer Y")
-    axes[1].set_ylabel("g")
-    axes[1].grid(True)
-
-    axes[2].plot(df.index, df["acc_z"], color="C2")
-    axes[2].set_title("Accelerometer Z")
-    axes[2].set_ylabel("g")
-    axes[2].grid(True)
+    axes[0].legend()
+    axes[0].grid(True)  
 
     # Gyroscope (one combined plot for 3 axes)
-    axes[3].plot(df.index, df["gyro_x"], label="gyro_x")
-    axes[3].plot(df.index, df["gyro_y"], label="gyro_y")
-    axes[3].plot(df.index, df["gyro_z"], label="gyro_z")
-    axes[3].set_title("Gyroscope")
-    axes[3].set_ylabel("deg/s")
-    axes[3].legend()
-    axes[3].grid(True)
+    axes[1].plot(df.index, df["gyro_x"], label="gyro_x")
+    axes[1].plot(df.index, df["gyro_y"], label="gyro_y")
+    axes[1].plot(df.index, df["gyro_z"], label="gyro_z")
+    axes[1].set_title("Gyroscope")
+    axes[1].set_ylabel("deg/s")
+    axes[1].legend()
+    axes[1].grid(True)
 
     # Light filters individually
-    axes[4].plot(df.index, df["f1"], color="C3")
-    axes[4].set_title("Light filter F1")
+    axes[2].plot(df.index, df["f1"], color="C3")
+    axes[2].set_title("Light filter F1")
+    axes[2].set_ylabel("counts")
+    axes[2].grid(True)
+
+    axes[3].plot(df.index, df["f2"], color="C4")
+    axes[3].set_title("Light filter F2")
+    axes[3].set_ylabel("counts")
+    axes[3].grid(True)
+
+    axes[4].plot(df.index, df["f3"], color="C5")
+    axes[4].set_title("Light filter F3")
     axes[4].set_ylabel("counts")
     axes[4].grid(True)
 
-    axes[5].plot(df.index, df["f2"], color="C4")
-    axes[5].set_title("Light filter F2")
+    axes[5].plot(df.index, df["f4"], color="C6")
+    axes[5].set_title("Light filter F4")
     axes[5].set_ylabel("counts")
     axes[5].grid(True)
 
-    axes[6].plot(df.index, df["f3"], color="C5")
-    axes[6].set_title("Light filter F3")
+    axes[6].plot(df.index, df["f5"], color="C7")
+    axes[6].set_title("Light filter F5")
     axes[6].set_ylabel("counts")
     axes[6].grid(True)
 
-    axes[7].plot(df.index, df["f4"], color="C6")
-    axes[7].set_title("Light filter F4")
+    axes[7].plot(df.index, df["f6"], color="C8")
+    axes[7].set_title("Light filter F6")
     axes[7].set_ylabel("counts")
     axes[7].grid(True)
 
-    axes[8].plot(df.index, df["f5"], color="C7")
-    axes[8].set_title("Light filter F5")
+    axes[8].plot(df.index, df["f7"], color="C9")
+    axes[8].set_title("Light filter F7")
     axes[8].set_ylabel("counts")
     axes[8].grid(True)
 
-    axes[9].plot(df.index, df["f6"], color="C8")
-    axes[9].set_title("Light filter F6")
+    axes[9].plot(df.index, df["f8"], color="C1")
+    axes[9].set_title("Light filter F8")
     axes[9].set_ylabel("counts")
     axes[9].grid(True)
 
-    axes[10].plot(df.index, df["f7"], color="C9")
-    axes[10].set_title("Light filter F7")
+    # NIR alone
+    axes[10].plot(df.index, df["nir"], color="C2")
+    axes[10].set_title("NIR channel")
     axes[10].set_ylabel("counts")
     axes[10].grid(True)
-
-    axes[11].plot(df.index, df["f8"], color="C1")
-    axes[11].set_title("Light filter F8")
-    axes[11].set_ylabel("counts")
-    axes[11].grid(True)
-
-    # NIR alone
-    axes[12].plot(df.index, df["nir"], color="C2")
-    axes[12].set_title("NIR channel")
-    axes[12].set_ylabel("counts")
-    axes[12].grid(True)
 
     # Mains category as a categorical track
     category_to_level = {
@@ -263,12 +256,12 @@ def process_bin_file(bin_filename, csv_filename=None):
         "60 Hz mains": 2,
     }
     levels = [category_to_level[c] for c in df["mains_category"]]
-    axes[13].step(df.index, levels, where="post")
-    axes[13].set_yticks(list(category_to_level.values()))
-    axes[13].set_yticklabels(list(category_to_level.keys()))
-    axes[13].set_title("Mains category")
-    axes[13].set_xlabel("Sample index")
-    axes[13].grid(True)
+    axes[11].step(df.index, levels, where="post")
+    axes[11].set_yticks(list(category_to_level.values()))
+    axes[11].set_yticklabels(list(category_to_level.keys()))
+    axes[11].set_title("Mains category")
+    axes[11].set_xlabel("Sample index")
+    axes[11].grid(True)
 
     plt.tight_layout()
     plt.show()

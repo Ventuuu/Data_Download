@@ -251,7 +251,7 @@ def process_bin_file(bin_filename, csv_filename=None):
 
     # Mains category as a categorical track
     category_to_level = {
-        "no mains / natural": 0,
+        "no mains / natural or DC": 0,
         "50 Hz mains": 1,
         "60 Hz mains": 2,
     }

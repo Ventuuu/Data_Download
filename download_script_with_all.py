@@ -40,7 +40,6 @@ MAGIC_AUDIO = b"AUD0"
 DEFAULT_BAUD_RATE = 250000
 DEFAULT_AUDIO_SAMPLE_RATE = 48000
 
-
 def u16_le(data: bytes) -> int:
     return struct.unpack("<H", data)[0]
 

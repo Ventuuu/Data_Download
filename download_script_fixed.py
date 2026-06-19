@@ -139,7 +139,7 @@ def process_bin_file(bin_filename, csv_filename=None):
                 elif mains_hz == 60:
                     mains_category_list.append("60 Hz mains")
                 else:
-                    mains_category_list.append("no mains / natural")
+                    mains_category_list.append("no mains / natural or DC")
 
     df = pd.DataFrame({
         "hh": hh_list,
@@ -185,9 +185,9 @@ def process_bin_file(bin_filename, csv_filename=None):
     fig, axes = plt.subplots(14, 1, figsize=(15, 26), sharex=True)
 
     # Accelerometer (one axis per subplot row)
-    axes[0].plot(df.index, df["acc_x"], Label = "acc_x")
-    axes[0].plot(df.index, df["acc_y"], Label = "acc_y")
-    axes[0].plot(df.index, df["acc_z"], Label = "acc_z")
+    axes[0].plot(df.index, df["acc_x"], label = "acc_x")
+    axes[0].plot(df.index, df["acc_y"], label = "acc_y")
+    axes[0].plot(df.index, df["acc_z"], label = "acc_z")
     axes[0].set_title("Accelerometer")
     axes[0].set_ylabel("g")
     axes[0].legend()

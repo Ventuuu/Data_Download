@@ -98,12 +98,12 @@ def process_bin_file(bin_filename, csv_filename=None):
                 a_sensitivity = 2.0 / 32767.0
                 g_sensitivity = 1.0 / 175.0
 
-                acc_x_list.append(gx[0] * a_sensitivity)
-                acc_y_list.append(gy[0] * a_sensitivity)
-                acc_z_list.append(gz[0] * a_sensitivity)
-                gyro_x_list.append(acc_x[0] * g_sensitivity)
-                gyro_y_list.append(acc_y[0] * g_sensitivity)
-                gyro_z_list.append(acc_z[0] * g_sensitivity)
+                acc_x_list.append(acc_x[0] * a_sensitivity)
+                acc_y_list.append(acc_y[0] * a_sensitivity)
+                acc_z_list.append(acc_z[0] * a_sensitivity)
+                gyro_x_list.append(gx[0] * g_sensitivity)
+                gyro_y_list.append(gy[0] * g_sensitivity)
+                gyro_z_list.append(gz[0] * g_sensitivity)
 
                 # ---- Light data decoding ----
                 # Filters F1..F8 (8 × uint16) are at bytes 17..32

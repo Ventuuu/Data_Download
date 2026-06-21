@@ -8,8 +8,9 @@ NAND page:
     16-byte LogPageHeader + payload
 
 Page magic:
-    b"SENS" -> IMU + AS7341 records, 40 bytes each
+    b"SENS" -> IMU records, 40 bytes each; bytes 17..38 reserved
     b"AUD0" -> PCM int16 audio
+    b"LITE" -> one AS7341 session result, 40-byte payload
 """
 
 import os
@@ -36,6 +37,59 @@ END_MARKER = b"LOGEND!!"
 
 MAGIC_SENSOR = b"SENS"
 MAGIC_AUDIO = b"AUD0"
+MAGIC_LIGHT = b"LITE"
+
+LIGHT_RESULT_PAYLOAD_SIZE = 40
+LIGHT_RESULT_STRUCT_FORMAT = "<10H4IB3s"
+NORMALIZATION_SCALE = 10000.0
+
+if struct.calcsize(LIGHT_RESULT_STRUCT_FORMAT) != LIGHT_RESULT_PAYLOAD_SIZE:
+    raise RuntimeError("Internal error: LITE payload struct size does not match expected size")
+
+LIGHT_LEVEL_LABELS = {
+    0: "DARK",
+    1: "LOW",
+    2: "NORMAL_INDOOR",
+    3: "BRIGHT",
+    4: "OUTDOOR",
+    5: "DIRECT_SUN",
+}
+
+LIGHT_RESULT_COLUMNS = [
+    "format_version",
+    "normalized_f1_raw",
+    "normalized_f2_raw",
+    "normalized_f3_raw",
+    "normalized_f4_raw",
+    "normalized_f5_raw",
+    "normalized_f6_raw",
+    "normalized_f7_raw",
+    "normalized_f8_raw",
+    "normalized_nir_raw",
+    "normalized_f1",
+    "normalized_f2",
+    "normalized_f3",
+    "normalized_f4",
+    "normalized_f5",
+    "normalized_f6",
+    "normalized_f7",
+    "normalized_f8",
+    "normalized_nir",
+    "clear_mean_counts",
+    "ambient_light_index",
+    "sample_count",
+    "acquisition_duration_ms",
+    "acquisition_duration_s",
+    "session_start_ms",
+    "light_level_class",
+    "light_level_label",
+    "page_sequence",
+    "page_timestamp_ms",
+    "physical_page_index",
+    "page_version",
+    "page_header_size",
+    "page_payload_bytes",
+]
 
 DEFAULT_BAUD_RATE = 250000
 DEFAULT_AUDIO_SAMPLE_RATE = 48000
@@ -114,8 +168,10 @@ class ParseStats:
     total_pages: int = 0
     sensor_pages: int = 0
     audio_pages: int = 0
+    light_pages: int = 0
     unknown_pages: int = 0
     sensor_records: int = 0
+    light_records: int = 0
     audio_bytes: int = 0
 
 
@@ -136,14 +192,10 @@ def parse_sensor_record(record: bytes) -> dict:
     gyro_y_raw = i16_le(record[13:15])
     gyro_z_raw = i16_le(record[15:17])
 
-    light = []
-    for k in range(8):
-        start = 17 + 2 * k
-        light.append(u16_le(record[start:start + 2]))
-
-    clear = u16_le(record[33:35])
-    nir = u16_le(record[35:37])
-    flicker_hz = u16_le(record[37:39])
+    legacy_light_reserved = record[17:39]
+    legacy_light_reserved_all_zero = all(byte == 0 for byte in legacy_light_reserved)
+    if not legacy_light_reserved_all_zero:
+        print("Warning: SENS legacy light reserved bytes 17..38 are not all zero.")
 
     time_ms_record = hh * 3600000 + mm * 60000 + ss * 1000 + sss
 
@@ -162,17 +214,85 @@ def parse_sensor_record(record: bytes) -> dict:
         "gyro_x_dps": gyro_x_raw * gyro_sensitivity_dps_per_lsb,
         "gyro_y_dps": gyro_y_raw * gyro_sensitivity_dps_per_lsb,
         "gyro_z_dps": gyro_z_raw * gyro_sensitivity_dps_per_lsb,
-        "F1": light[0], "F2": light[1], "F3": light[2], "F4": light[3],
-        "F5": light[4], "F6": light[5], "F7": light[6], "F8": light[7],
-        "Clear": clear,
-        "NIR": nir,
-        "Flicker_Hz": flicker_hz,
+        "legacy_light_reserved_all_zero": legacy_light_reserved_all_zero,
     }
 
 
-def parse_nand_dump(bin_filename: Path, csv_filename: Path, wav_filename: Path,
+def light_level_label(light_level_class: int) -> str:
+    return LIGHT_LEVEL_LABELS.get(light_level_class, f"UNKNOWN_{light_level_class}")
+
+
+def parse_light_result_payload(payload: bytes) -> dict:
+    if len(payload) < LIGHT_RESULT_PAYLOAD_SIZE:
+        raise ValueError(
+            f"LITE payload must be at least {LIGHT_RESULT_PAYLOAD_SIZE} bytes; got {len(payload)}"
+        )
+
+    # Decode only the fixed 40-byte LITE result. Any remaining bytes are page padding.
+    payload = payload[:LIGHT_RESULT_PAYLOAD_SIZE]
+    unpacked = struct.unpack(LIGHT_RESULT_STRUCT_FORMAT, payload)
+    (
+        format_version,
+        normalized_f1_raw,
+        normalized_f2_raw,
+        normalized_f3_raw,
+        normalized_f4_raw,
+        normalized_f5_raw,
+        normalized_f6_raw,
+        normalized_f7_raw,
+        normalized_f8_raw,
+        normalized_nir_raw,
+        clear_mean_counts,
+        sample_count,
+        acquisition_duration_ms,
+        session_start_ms,
+        light_level_class_value,
+        reserved,
+    ) = unpacked
+
+    if reserved != b"\x00\x00\x00":
+        print(f"Warning: LITE reserved bytes are not zero: {reserved!r}")
+
+    raw_values = {
+        "normalized_f1_raw": normalized_f1_raw,
+        "normalized_f2_raw": normalized_f2_raw,
+        "normalized_f3_raw": normalized_f3_raw,
+        "normalized_f4_raw": normalized_f4_raw,
+        "normalized_f5_raw": normalized_f5_raw,
+        "normalized_f6_raw": normalized_f6_raw,
+        "normalized_f7_raw": normalized_f7_raw,
+        "normalized_f8_raw": normalized_f8_raw,
+        "normalized_nir_raw": normalized_nir_raw,
+    }
+
+    parsed = {
+        "format_version": format_version,
+        **raw_values,
+    }
+
+    for key, value in raw_values.items():
+        parsed[key[:-4]] = value / NORMALIZATION_SCALE
+
+    parsed.update(
+        {
+            "clear_mean_counts": clear_mean_counts,
+            "ambient_light_index": clear_mean_counts,
+            "sample_count": sample_count,
+            "acquisition_duration_ms": acquisition_duration_ms,
+            "acquisition_duration_s": acquisition_duration_ms / 1000.0,
+            "session_start_ms": session_start_ms,
+            "light_level_class": light_level_class_value,
+            "light_level_label": light_level_label(light_level_class_value),
+        }
+    )
+
+    return parsed
+
+
+def parse_nand_dump(bin_filename: Path, imu_csv_filename: Path, light_csv_filename: Path, wav_filename: Path,
                     summary_filename: Path, audio_sample_rate_hz: int):
     sensor_rows = []
+    light_rows = []
     audio_bytes = bytearray()
     stats = ParseStats()
 
@@ -220,6 +340,30 @@ def parse_nand_dump(bin_filename: Path, csv_filename: Path, wav_filename: Path,
                 stats.audio_pages += 1
                 audio_bytes.extend(payload)
 
+            elif magic == MAGIC_LIGHT:
+                stats.light_pages += 1
+                if payload_bytes < LIGHT_RESULT_PAYLOAD_SIZE:
+                    print(
+                        f"Warning: LITE page_sequence={page_sequence} has payload_bytes={payload_bytes}; "
+                        f"expected at least {LIGHT_RESULT_PAYLOAD_SIZE}"
+                    )
+                    physical_page_index += 1
+                    continue
+                if payload_bytes != LIGHT_RESULT_PAYLOAD_SIZE:
+                    print(
+                        f"Warning: LITE page_sequence={page_sequence} has payload_bytes={payload_bytes}; "
+                        f"using first {LIGHT_RESULT_PAYLOAD_SIZE} bytes"
+                    )
+
+                parsed = parse_light_result_payload(payload)
+                parsed["physical_page_index"] = physical_page_index
+                parsed["page_sequence"] = page_sequence
+                parsed["page_timestamp_ms"] = page_timestamp_ms
+                parsed["page_version"] = version
+                parsed["page_header_size"] = header_size
+                parsed["page_payload_bytes"] = payload_bytes
+                light_rows.append(parsed)
+
             else:
                 stats.unknown_pages += 1
                 print(
@@ -230,10 +374,13 @@ def parse_nand_dump(bin_filename: Path, csv_filename: Path, wav_filename: Path,
             physical_page_index += 1
 
     stats.sensor_records = len(sensor_rows)
+    stats.light_records = len(light_rows)
     stats.audio_bytes = len(audio_bytes)
 
-    df = pd.DataFrame(sensor_rows)
-    df.to_csv(csv_filename, index=False)
+    imu_df = pd.DataFrame(sensor_rows)
+    light_df = pd.DataFrame(light_rows, columns=LIGHT_RESULT_COLUMNS)
+    imu_df.to_csv(imu_csv_filename, index=False)
+    light_df.to_csv(light_csv_filename, index=False)
 
     write_wav_int16_mono(wav_filename, bytes(audio_bytes), audio_sample_rate_hz)
 
@@ -241,27 +388,39 @@ def parse_nand_dump(bin_filename: Path, csv_filename: Path, wav_filename: Path,
         f"Total pages: {stats.total_pages}\n"
         f"Sensor pages: {stats.sensor_pages}\n"
         f"Audio pages: {stats.audio_pages}\n"
+        f"Light pages: {stats.light_pages}\n"
         f"Unknown pages: {stats.unknown_pages}\n"
         f"Sensor records: {stats.sensor_records}\n"
+        f"Light records: {stats.light_records}\n"
         f"Audio bytes: {stats.audio_bytes}\n"
         f"Audio samples: {stats.audio_bytes // 2}\n"
-        f"Audio sample rate assumed: {audio_sample_rate_hz} Hz\n"
-        f"CSV file: {csv_filename.name}\n"
+        f"Audio sample rate: {audio_sample_rate_hz} Hz\n"
+        f"IMU CSV file: {imu_csv_filename.name}\n"
+        f"Light CSV file: {light_csv_filename.name}\n"
         f"WAV file: {wav_filename.name}\n"
     )
+    if not light_df.empty:
+        last_light = light_df.iloc[-1]
+        summary += (
+            f"Last light class: {last_light['light_level_label']}\n"
+            f"Last Clear mean counts: {last_light['clear_mean_counts']}\n"
+            f"Last sample count: {last_light['sample_count']}\n"
+            f"Last acquisition duration: {last_light['acquisition_duration_ms']} ms\n"
+        )
     summary_filename.write_text(summary, encoding="utf-8")
 
     print(summary)
-    print(f"Sensor CSV saved to: {csv_filename}")
+    print(f"IMU CSV saved to: {imu_csv_filename}")
+    print(f"Light CSV saved to: {light_csv_filename}")
     print(f"Audio WAV saved to: {wav_filename}")
     print(f"Summary saved to: {summary_filename}")
 
-    return df, bytes(audio_bytes), stats
+    return imu_df, light_df, bytes(audio_bytes), stats
 
 
-def plot_sensor_data(df: pd.DataFrame, output_prefix: Path) -> None:
+def plot_imu_data(df: pd.DataFrame, output_prefix: Path) -> None:
     if df.empty:
-        print("No sensor data available; skipping sensor plots.")
+        print("No IMU data available; skipping IMU plots.")
         return
 
     t = df["time_ms_record"].to_numpy(dtype=float) / 1000.0
@@ -299,31 +458,55 @@ def plot_sensor_data(df: pd.DataFrame, output_prefix: Path) -> None:
     plt.savefig(gyro_png, dpi=200)
     plt.show()
 
-    plt.figure(figsize=(12, 6))
-    for channel in ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "Clear", "NIR"]:
-        if channel in df:
-            plt.plot(t, df[channel], label=channel)
-    plt.xlabel(x_label)
-    plt.ylabel("Raw counts")
-    plt.title("AS7341 light channels")
-    plt.grid(True)
-    plt.legend(ncol=2)
-    plt.tight_layout()
-    light_png = output_prefix.with_name(output_prefix.name + "_light_channels.png")
-    plt.savefig(light_png, dpi=200)
-    plt.show()
 
-    if "Flicker_Hz" in df.columns:
-        plt.figure(figsize=(12, 3))
-        plt.step(t, df["Flicker_Hz"], where="post")
-        plt.xlabel(x_label)
-        plt.ylabel("Flicker [Hz]")
-        plt.title("Mains flicker classification")
-        plt.grid(True)
+def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
+    if light_df.empty:
+        print("No LITE pages found; skipping light plots.")
+        return
+
+    channels = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "NIR"]
+    wavelengths_nm = [415, 445, 480, 515, 555, 590, 630, 680, 910]
+    value_columns = [
+        "normalized_f1",
+        "normalized_f2",
+        "normalized_f3",
+        "normalized_f4",
+        "normalized_f5",
+        "normalized_f6",
+        "normalized_f7",
+        "normalized_f8",
+        "normalized_nir",
+    ]
+    x_labels = [f"{channel}\n{wavelength} nm" for channel, wavelength in zip(channels, wavelengths_nm)]
+
+    for row_index, (_, row) in enumerate(light_df.iterrows(), start=1):
+        values = [row[column] for column in value_columns]
+        suffix = "_light_signature.png"
+        if len(light_df) > 1:
+            suffix = f"_light_signature_{row_index:02d}.png"
+
+        title = (
+            "AS7341 normalized multispectral signature\n"
+            f"Light level: {row['light_level_label']} | "
+            f"Ambient light index: {row['clear_mean_counts']} counts | "
+            f"Samples: {row['sample_count']} | "
+            f"Duration: {row['acquisition_duration_ms']} ms"
+        )
+
+        plt.figure(figsize=(10, 5))
+        plt.bar(x_labels, values)
+        plt.ylim(0, 1.05)
+        plt.xlabel("Channel and central wavelength")
+        plt.ylabel("Normalized response")
+        plt.title(title)
+        plt.grid(axis="y", alpha=0.35)
         plt.tight_layout()
-        flicker_png = output_prefix.with_name(output_prefix.name + "_flicker.png")
-        plt.savefig(flicker_png, dpi=200)
+        light_png = output_prefix.with_name(output_prefix.name + suffix)
+        plt.savefig(light_png, dpi=200)
         plt.show()
+
+        print(f"Ambient light index: {row['clear_mean_counts']} counts")
+        print(f"Light level: {row['light_level_label']}")
 
 
 def plot_audio_waveform(audio_bytes: bytes, sample_rate_hz: int, output_prefix: Path) -> None:
@@ -426,7 +609,8 @@ def main():
     output_prefix = save_folder / timestamp
 
     bin_filename = output_prefix.with_name(output_prefix.name + "_nand_dump.bin")
-    csv_filename = output_prefix.with_name(output_prefix.name + "_imu_light.csv")
+    imu_csv_filename = output_prefix.with_name(output_prefix.name + "_imu.csv")
+    light_csv_filename = output_prefix.with_name(output_prefix.name + "_light_results.csv")
     wav_filename = output_prefix.with_name(output_prefix.name + "_audio.wav")
     summary_filename = output_prefix.with_name(output_prefix.name + "_summary.txt")
 
@@ -442,15 +626,17 @@ def main():
         return
 
     try:
-        df, audio_bytes, _ = parse_nand_dump(
+        imu_df, light_df, audio_bytes, _ = parse_nand_dump(
             bin_filename=bin_filename,
-            csv_filename=csv_filename,
+            imu_csv_filename=imu_csv_filename,
+            light_csv_filename=light_csv_filename,
             wav_filename=wav_filename,
             summary_filename=summary_filename,
             audio_sample_rate_hz=audio_sample_rate,
         )
 
-        plot_sensor_data(df, output_prefix)
+        plot_imu_data(imu_df, output_prefix)
+        plot_light_results(light_df, output_prefix)
         plot_audio_waveform(audio_bytes, audio_sample_rate, output_prefix)
 
     except Exception as exc:

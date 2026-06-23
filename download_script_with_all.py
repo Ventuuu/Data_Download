@@ -442,7 +442,6 @@ def plot_imu_data(df: pd.DataFrame, output_prefix: Path) -> None:
     plt.tight_layout()
     acc_png = output_prefix.with_name(output_prefix.name + "_accelerometer.png")
     plt.savefig(acc_png, dpi=200)
-    plt.show()
 
     plt.figure(figsize=(12, 5))
     plt.plot(t, df["gyro_x_dps"], label="Gyro X")
@@ -456,7 +455,6 @@ def plot_imu_data(df: pd.DataFrame, output_prefix: Path) -> None:
     plt.tight_layout()
     gyro_png = output_prefix.with_name(output_prefix.name + "_gyroscope.png")
     plt.savefig(gyro_png, dpi=200)
-    plt.show()
 
 
 def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
@@ -503,7 +501,6 @@ def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
         plt.tight_layout()
         light_png = output_prefix.with_name(output_prefix.name + suffix)
         plt.savefig(light_png, dpi=200)
-        plt.show()
 
         print(f"Ambient light index: {row['clear_mean_counts']} counts")
         print(f"Light level: {row['light_level_label']}")
@@ -530,7 +527,6 @@ def plot_audio_waveform(audio_bytes: bytes, sample_rate_hz: int, output_prefix: 
     plt.tight_layout()
     audio_png = output_prefix.with_name(output_prefix.name + "_audio_waveform.png")
     plt.savefig(audio_png, dpi=200)
-    plt.show()
 
 
 def gui_select_com_and_folder():
@@ -638,6 +634,7 @@ def main():
         plot_imu_data(imu_df, output_prefix)
         plot_light_results(light_df, output_prefix)
         plot_audio_waveform(audio_bytes, audio_sample_rate, output_prefix)
+        plt.show()
 
     except Exception as exc:
         messagebox.showerror("Processing error", str(exc))

@@ -506,6 +506,53 @@ def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
         print(f"Light level: {row['light_level_label']}")
 
 
+def plot_light_sensor_channels(light_df: pd.DataFrame, output_prefix: Path) -> None:
+    if light_df.empty:
+        print("No LITE pages found; skipping light sensor channel plot.")
+        return
+
+    channel_plots = [
+        ("F1", "normalized_f1_raw", "C3"),
+        ("F2", "normalized_f2_raw", "C4"),
+        ("F3", "normalized_f3_raw", "C5"),
+        ("F4", "normalized_f4_raw", "C6"),
+        ("F5", "normalized_f5_raw", "C7"),
+        ("F6", "normalized_f6_raw", "C8"),
+        ("F7", "normalized_f7_raw", "C9"),
+        ("F8", "normalized_f8_raw", "C1"),
+        ("NIR", "normalized_nir_raw", "C2"),
+        ("Clear", "clear_mean_counts", "C0"),
+    ]
+
+    x = np.arange(len(light_df), dtype=int)
+    fig, axes = plt.subplots(len(channel_plots) + 1, 1, figsize=(15, 22), sharex=True)
+    fig.suptitle("Light sensor channels", fontsize=14)
+
+    for axis, (label, column, color) in zip(axes[:-1], channel_plots):
+        axis.plot(x, light_df[column].to_numpy(), color=color, marker="o", linewidth=1.4)
+        axis.set_title(f"Light filter {label}" if label != "Clear" else "Clear channel")
+        axis.set_ylabel("counts")
+        axis.grid(True)
+
+    level_axis = axes[-1]
+    level_axis.step(
+        x,
+        light_df["light_level_class"].to_numpy(),
+        where="post",
+        color="C10",
+        linewidth=1.4,
+    )
+    level_axis.set_yticks(sorted(LIGHT_LEVEL_LABELS.keys()))
+    level_axis.set_yticklabels([LIGHT_LEVEL_LABELS[key] for key in sorted(LIGHT_LEVEL_LABELS.keys())])
+    level_axis.set_title("Light level class")
+    level_axis.set_xlabel("Light record index")
+    level_axis.grid(True)
+
+    plt.tight_layout()
+    light_channels_png = output_prefix.with_name(output_prefix.name + "_light_sensor_channels.png")
+    plt.savefig(light_channels_png, dpi=200)
+
+
 def plot_audio_waveform(audio_bytes: bytes, sample_rate_hz: int, output_prefix: Path) -> None:
     if not audio_bytes:
         print("No audio data available; skipping audio plot.")
@@ -633,6 +680,7 @@ def main():
 
         plot_imu_data(imu_df, output_prefix)
         plot_light_results(light_df, output_prefix)
+        plot_light_sensor_channels(light_df, output_prefix)
         plot_audio_waveform(audio_bytes, audio_sample_rate, output_prefix)
         plt.show()
 

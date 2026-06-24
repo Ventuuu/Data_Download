@@ -1384,17 +1384,18 @@ def plot_light_raw_channels(
 
     # Complete channel definition, also used by the combined plot.
     channel_plots = [
-        ("F1 - 415 nm", "f1_counts"),
-        ("F2 - 445 nm", "f2_counts"),
-        ("F3 - 480 nm", "f3_counts"),
-        ("F4 - 515 nm", "f4_counts"),
-        ("F5 - 555 nm", "f5_counts"),
-        ("F6 - 590 nm", "f6_counts"),
-        ("F7 - 630 nm", "f7_counts"),
-        ("F8 - 680 nm", "f8_counts"),
-        ("Clear", "clear_counts"),
-        ("NIR - 910 nm", "nir_counts"),
-    ]
+    # label, DataFrame column, color, line style
+    ("F1 - 415 nm", "f1_counts", "#7F3FBF", "-"),       # violet
+    ("F2 - 445 nm", "f2_counts", "#123B73", "-"),       # dark blue
+    ("F3 - 480 nm", "f3_counts", "#00AEEF", "-"),       # blue/cyan
+    ("F4 - 515 nm", "f4_counts", "#00D5D8", "-"),       # cyan
+    ("F5 - 555 nm", "f5_counts", "#00A651", "-"),       # green
+    ("F6 - 590 nm", "f6_counts", "#F2D600", "-"),       # yellow
+    ("F7 - 630 nm", "f7_counts", "#FF9900", "-"),       # orange
+    ("F8 - 680 nm", "f8_counts", "#FF1F1F", "-"),       # red
+    ("Clear - broadband", "clear_counts", "#666666", "--"),
+    ("NIR - 910 nm", "nir_counts", "#C00000", "-"),     # dark red
+]
 
     # Subdivision requested for the separate figures.
     channel_groups = [
@@ -1444,14 +1445,16 @@ def plot_light_raw_channels(
             fontsize=14,
         )
 
-        for axis, (label, column) in zip(axes, group_channels):
+        for axis, (label, column, color, linestyle) in zip(axes, group_channels):
             y = light_raw_df[column].to_numpy(dtype=float)
 
             axis.plot(
                 x,
                 y,
-                linewidth=1.2,
+                linewidth=1.4,
                 label=label,
+                color=color,
+                linestyle=linestyle,
             )
 
             axis.set_ylabel("Raw ADC counts")
@@ -1480,13 +1483,15 @@ def plot_light_raw_channels(
         constrained_layout=True,
     )
 
-    for label, column in channel_plots:
+    for label, column, color, linestyle in channel_plots:
         ax_all.plot(
-            x,
-            light_raw_df[column].to_numpy(dtype=float),
-            label=label,
-            linewidth=1.0,
-        )
+        x,
+        light_raw_df[column].to_numpy(dtype=float),
+        label=label,
+        linewidth=1.2,
+        color=color,
+        linestyle=linestyle,
+    )
 
     ax_all.set_xlabel(x_label)
     ax_all.set_ylabel("Raw ADC counts")
@@ -1532,12 +1537,15 @@ def plot_light_raw_channels(
         x,
         light_raw_df["nir_counts"].to_numpy(dtype=float),
         label="NIR - 910 nm",
-        linewidth=1.2,
+        linewidth=1.4,
+        color="#C00000",
+        linestyle="-",
     )
 
     ax_nir.scatter(
         [max_x],
         [nir_max_value],
+        color="#C00000",
         zorder=3,
     )
 

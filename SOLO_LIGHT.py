@@ -1382,6 +1382,7 @@ def plot_light_raw_channels(
         print("Plots skipped. Inspect the byte-level diagnostic report.")
         return
 
+    # Complete channel definition, also used by the combined plot.
     channel_plots = [
         ("F1 - 415 nm", "f1_counts"),
         ("F2 - 445 nm", "f2_counts"),
@@ -1395,78 +1396,185 @@ def plot_light_raw_channels(
         ("NIR - 910 nm", "nir_counts"),
     ]
 
+    # Subdivision requested for the separate figures.
+    channel_groups = [
+        {
+            "title": "AS7341 raw channel counts: F1-F4",
+            "suffix": "_light_raw_f1_f4.png",
+            "channels": channel_plots[0:4],
+        },
+        {
+            "title": "AS7341 raw channel counts: F5-F8",
+            "suffix": "_light_raw_f5_f8.png",
+            "channels": channel_plots[4:8],
+        },
+        {
+            "title": "AS7341 raw channel counts: Clear and NIR",
+            "suffix": "_light_raw_clear_nir.png",
+            "channels": channel_plots[8:10],
+        },
+    ]
+
     x, x_label = get_light_plot_x_axis(light_raw_df, diagnostics)
+
     title_suffix = ""
     if diagnostics.get("is_severely_suspicious"):
         title_suffix = "\nWARNING: suspicious LRAW data"
 
-    fig, axes = plt.subplots(
-        len(channel_plots),
-        1,
-        figsize=(15, 24),
-        sharex=True,
+    # ------------------------------------------------------------------
+    # Three separate multi-panel figures
+    # ------------------------------------------------------------------
+    for group in channel_groups:
+        group_channels = group["channels"]
+
+        fig, axes = plt.subplots(
+            nrows=len(group_channels),
+            ncols=1,
+            figsize=(14, 3.2 * len(group_channels)),
+            sharex=True,
+            constrained_layout=True,
+        )
+
+        # With two or more channels, axes is normally an ndarray.
+        # np.atleast_1d also makes the code robust for future one-channel groups.
+        axes = np.atleast_1d(axes)
+
+        fig.suptitle(
+            group["title"] + title_suffix,
+            fontsize=14,
+        )
+
+        for axis, (label, column) in zip(axes, group_channels):
+            y = light_raw_df[column].to_numpy(dtype=float)
+
+            axis.plot(
+                x,
+                y,
+                linewidth=1.2,
+                label=label,
+            )
+
+            axis.set_ylabel("Raw ADC counts")
+            axis.grid(True, alpha=0.45)
+            axis.legend(loc="upper right")
+
+        axes[-1].set_xlabel(x_label)
+
+        output_file = output_prefix.with_name(
+            output_prefix.name + group["suffix"]
+        )
+
+        fig.savefig(
+            output_file,
+            dpi=200,
+            bbox_inches="tight",
+        )
+
+        print(f"Raw light channel plot saved to: {output_file}")
+
+    # ------------------------------------------------------------------
+    # Existing combined plot with all ten channels
+    # ------------------------------------------------------------------
+    fig_all, ax_all = plt.subplots(
+        figsize=(14, 7),
+        constrained_layout=True,
     )
-    fig.suptitle("AS7341 raw channel counts over time" + title_suffix, fontsize=14)
 
-    for axis, (label, column) in zip(axes, channel_plots):
-        axis.plot(x, light_raw_df[column].to_numpy(dtype=float), linewidth=1.2)
-        axis.set_title(label)
-        axis.set_ylabel("Raw ADC counts")
-        axis.grid(True)
-
-    axes[-1].set_xlabel(x_label)
-    plt.tight_layout(rect=(0, 0, 1, 0.985))
-    output_file = output_prefix.with_name(
-        output_prefix.name + "_light_raw_channels.png"
-    )
-    plt.savefig(output_file, dpi=200)
-    print(f"Raw light channel plot saved to: {output_file}")
-
-    plt.figure(figsize=(14, 7))
     for label, column in channel_plots:
-        plt.plot(x, light_raw_df[column].to_numpy(dtype=float), label=label, linewidth=1.0)
-    plt.xlabel(x_label)
-    plt.ylabel("Raw ADC counts")
-    plt.title("AS7341 raw channel counts over time" + title_suffix)
-    plt.grid(True)
-    plt.legend(ncol=2)
-    plt.tight_layout()
+        ax_all.plot(
+            x,
+            light_raw_df[column].to_numpy(dtype=float),
+            label=label,
+            linewidth=1.0,
+        )
+
+    ax_all.set_xlabel(x_label)
+    ax_all.set_ylabel("Raw ADC counts")
+    ax_all.set_title(
+        "AS7341 raw channel counts over time" + title_suffix
+    )
+    ax_all.grid(True, alpha=0.45)
+    ax_all.legend(ncol=2)
+
     all_channels_file = output_prefix.with_name(
         output_prefix.name + "_light_raw_all_channels.png"
     )
-    plt.savefig(all_channels_file, dpi=200)
+
+    fig_all.savefig(
+        all_channels_file,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
     print(f"Combined raw light plot saved to: {all_channels_file}")
 
+    # ------------------------------------------------------------------
+    # Existing separate NIR plot with maximum annotation
+    # ------------------------------------------------------------------
     nir_max_idx = light_raw_df["nir_counts"].idxmax()
     nir_max_row = light_raw_df.loc[nir_max_idx]
+
     nir_max_value = int(nir_max_row["nir_counts"])
     nir_max_time = float(nir_max_row["sample_elapsed_s"])
     nir_max_sample = int(nir_max_row["sample_index"])
 
-    plt.figure(figsize=(12, 5))
-    plt.plot(x, light_raw_df["nir_counts"].to_numpy(dtype=float), label="NIR - 910 nm")
-    max_x = nir_max_time if x_label == "Time [s]" else nir_max_sample
-    plt.scatter([max_x], [nir_max_value], zorder=3)
-    plt.annotate(
-        f"max={nir_max_value}\nsample={nir_max_sample}\ntime={nir_max_time:.3f} s",
+    if x_label == "Time [s]":
+        max_x = nir_max_time
+    else:
+        max_x = nir_max_sample
+
+    fig_nir, ax_nir = plt.subplots(
+        figsize=(12, 5),
+        constrained_layout=True,
+    )
+
+    ax_nir.plot(
+        x,
+        light_raw_df["nir_counts"].to_numpy(dtype=float),
+        label="NIR - 910 nm",
+        linewidth=1.2,
+    )
+
+    ax_nir.scatter(
+        [max_x],
+        [nir_max_value],
+        zorder=3,
+    )
+
+    ax_nir.annotate(
+        (
+            f"max={nir_max_value}\n"
+            f"sample={nir_max_sample}\n"
+            f"time={nir_max_time:.3f} s"
+        ),
         xy=(max_x, nir_max_value),
         xytext=(10, 10),
         textcoords="offset points",
     )
-    plt.xlabel(x_label)
-    plt.ylabel("Raw ADC counts")
-    plt.title("AS7341 NIR raw counts" + title_suffix)
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    nir_file = output_prefix.with_name(output_prefix.name + "_light_raw_nir.png")
-    plt.savefig(nir_file, dpi=200)
+
+    ax_nir.set_xlabel(x_label)
+    ax_nir.set_ylabel("Raw ADC counts")
+    ax_nir.set_title(
+        "AS7341 NIR raw counts" + title_suffix
+    )
+    ax_nir.grid(True, alpha=0.45)
+    ax_nir.legend()
+
+    nir_file = output_prefix.with_name(
+        output_prefix.name + "_light_raw_nir.png"
+    )
+
+    fig_nir.savefig(
+        nir_file,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
     print(f"NIR plot saved to: {nir_file}")
 
     print(f"Maximum NIR count: {nir_max_value}")
     print(f"NIR maximum sample index: {nir_max_sample}")
     print(f"NIR maximum time: {nir_max_time:.3f} s")
-
 
 def plot_audio_waveform(audio_bytes: bytes, sample_rate_hz: int, output_prefix: Path) -> None:
     if not audio_bytes:

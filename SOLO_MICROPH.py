@@ -31,6 +31,7 @@ detect inconsistencies, but it cannot always prove the firmware-side cause.
 """
 
 import os
+import csv
 import struct
 import tempfile
 import wave
@@ -194,6 +195,16 @@ AUDIO_MAGNITUDE_SEGMENT_SAMPLES = 4096
 AUDIO_MAGNITUDE_OVERLAP = 0.5
 AUDIO_MAGNITUDE_MAX_FREQUENCY_HZ = 12000.0
 AUDIO_MAGNITUDE_DBFS_FLOOR = -160.0
+SPL_CALIBRATION_OFFSET_DB = 122.40
+SPL_CALIBRATION_REPEATABILITY_STD_DB = 0.53
+SPL_CALIBRATION_FREQUENCY_HZ = 1000.0
+SPL_CALIBRATION_WEIGHTING = "Z"
+SPL_CALIBRATION_REFERENCE = "Smartphone sound level meter application"
+SPL_CALIBRATION_APPROXIMATE = True
+SPL_CALIBRATION_PHONE_LEVELS_DBZ = (59.0, 68.0, 76.0)
+SPL_CALIBRATION_SENSOR_LEVELS_DBFS = (-56.763, -46.350, -40.499)
+AUDIO_SOUND_LEVEL_WINDOW_S = 1.0
+AUDIO_SOUND_LEVEL_HOP_S = 1.0
 
 def u16_le(data: bytes) -> int:
     return struct.unpack("<H", data)[0]
@@ -250,6 +261,20 @@ class AudioMetrics:
     amplification_gain_linear: float
     amplification_gain_db: float
     amplified_target_peak_dbfs: float
+
+
+@dataclass
+class EstimatedSoundLevelMetrics:
+    calibration_offset_db: float
+    calibration_repeatability_std_db: float
+    calibration_frequency_hz: float
+    calibration_weighting: str
+    calibration_reference: str
+    calibration_approximate: bool
+    unweighted_rms_dbfs: float
+    a_weighted_rms_dbfs: float
+    estimated_lzeq_dbz: float
+    estimated_laeq_dba: float
 
 
 def write_wav_int16_mono(filename: Path, pcm_bytes: bytes, sample_rate_hz: int) -> None:
@@ -411,16 +436,50 @@ def _metrics_report_lines(metrics: AudioMetrics) -> list[str]:
     ]
 
 
-def write_audio_metrics_report(report_filename: Path, metrics: AudioMetrics) -> None:
+def write_audio_metrics_report(
+    report_filename: Path,
+    metrics: AudioMetrics,
+    sound_metrics: EstimatedSoundLevelMetrics | None = None,
+) -> None:
     """Write a standalone text report with raw-signal audio metrics."""
-    report_filename.write_text("\n".join(_metrics_report_lines(metrics)) + "\n", encoding="utf-8")
+    lines = _metrics_report_lines(metrics)
+    if sound_metrics is not None:
+        lines.extend(_sound_level_report_lines(sound_metrics))
+    report_filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Audio metrics report saved to: {report_filename}")
 
 
-def append_audio_metrics_to_summary(summary_filename: Path, metrics: AudioMetrics) -> None:
+def append_audio_metrics_to_summary(
+    summary_filename: Path,
+    metrics: AudioMetrics,
+    sound_metrics: EstimatedSoundLevelMetrics | None = None,
+) -> None:
     """Append the audio metrics section to the existing parser summary."""
     lines = ["", "Audio metrics summary"]
     lines.extend(_metrics_report_lines(metrics)[1:])
+    if sound_metrics is not None:
+        lines.extend(
+            [
+                "",
+                "Estimated acoustic sound levels summary",
+                f"Calibration offset: {sound_metrics.calibration_offset_db:.2f} dB",
+                (
+                    "Calibration uncertainty from repeatability: "
+                    f"{sound_metrics.calibration_repeatability_std_db:.2f} dB"
+                ),
+                (
+                    "Estimated global LZeq [dBZ]: "
+                    f"{_format_db(sound_metrics.estimated_lzeq_dbz, 'dBZ')}"
+                ),
+                (
+                    "Estimated global LAeq [dBA]: "
+                    f"{_format_db(sound_metrics.estimated_laeq_dba, 'dBA')}"
+                ),
+                "Calibration status: approximate"
+                if sound_metrics.calibration_approximate
+                else "Calibration status: certified",
+            ]
+        )
     with summary_filename.open("a", encoding="utf-8") as summary_file:
         summary_file.write("\n".join(lines) + "\n")
 
@@ -440,6 +499,292 @@ def print_audio_metrics(metrics: AudioMetrics) -> None:
         "  Clipped samples: "
         f"{metrics.clipped_sample_count} ({metrics.clipped_sample_percentage:.6f}%)"
     )
+
+
+def a_weighting_db(frequencies_hz: np.ndarray) -> np.ndarray:
+    """Return the standard A-weighting response in dB for each frequency."""
+    frequencies = np.asarray(frequencies_hz, dtype=np.float64)
+    f_squared = frequencies ** 2
+    f1 = 20.598997
+    f2 = 107.65265
+    f3 = 737.86223
+    f4 = 12194.217
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        numerator = (f4 ** 2) * (f_squared ** 2)
+        denominator = (
+            (f_squared + f1 ** 2)
+            * np.sqrt((f_squared + f2 ** 2) * (f_squared + f3 ** 2))
+            * (f_squared + f4 ** 2)
+        )
+        response = numerator / denominator
+        weighting = 20.0 * np.log10(response) + 2.0
+
+    weighting = np.asarray(weighting, dtype=np.float64)
+    weighting[frequencies <= 0.0] = float("-inf")
+    return weighting
+
+
+def _normalized_zero_mean_audio(audio: np.ndarray) -> np.ndarray:
+    if len(audio) == 0:
+        return np.array([], dtype=np.float64)
+    x = audio.astype(np.float64) / INT16_FULL_SCALE
+    return x - float(np.mean(x))
+
+
+def compute_unweighted_rms_dbfs(audio: np.ndarray) -> tuple[float, float]:
+    """Compute zero-mean RMS on full-scale normalized audio."""
+    x = _normalized_zero_mean_audio(audio)
+    if len(x) == 0:
+        return 0.0, float("-inf")
+    rms = float(np.sqrt(np.mean(x ** 2)))
+    return rms, _db20_from_ratio(rms)
+
+
+def compute_a_weighted_rms_dbfs(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+) -> tuple[float, float]:
+    """Compute A-weighted RMS using an FFT, A-power weights and Parseval."""
+    sample_count = len(audio)
+    if sample_count == 0 or sample_rate_hz <= 0:
+        return 0.0, float("-inf")
+
+    x = _normalized_zero_mean_audio(audio)
+    if len(x) == 0:
+        return 0.0, float("-inf")
+
+    spectrum = np.fft.rfft(x)
+    frequencies = np.fft.rfftfreq(
+        x.size,
+        d=1.0 / float(sample_rate_hz),
+    )
+    weighting_db = a_weighting_db(frequencies)
+    weighting_power = np.zeros_like(weighting_db, dtype=np.float64)
+    finite_weighting = np.isfinite(weighting_db)
+    weighting_power[finite_weighting] = 10.0 ** (weighting_db[finite_weighting] / 10.0)
+
+    one_sided_factor = np.ones_like(weighting_power, dtype=np.float64)
+    if x.size > 1:
+        if x.size % 2 == 0:
+            one_sided_factor[1:-1] = 2.0
+        else:
+            one_sided_factor[1:] = 2.0
+
+    power_bins = np.abs(spectrum) ** 2
+    mean_square_a = float(
+        np.sum(one_sided_factor * power_bins * weighting_power) / float(x.size ** 2)
+    )
+    if mean_square_a <= 0.0 or not np.isfinite(mean_square_a):
+        return 0.0, float("-inf")
+
+    rms_a = float(np.sqrt(mean_square_a))
+    return rms_a, _db20_from_ratio(rms_a)
+
+
+def compute_estimated_sound_level_metrics(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+) -> EstimatedSoundLevelMetrics:
+    """Compute global approximate Z and A sound-level estimates."""
+    _, unweighted_rms_dbfs = compute_unweighted_rms_dbfs(audio)
+    _, a_weighted_rms_dbfs = compute_a_weighted_rms_dbfs(audio, sample_rate_hz)
+
+    estimated_lzeq_dbz = (
+        unweighted_rms_dbfs + SPL_CALIBRATION_OFFSET_DB
+        if np.isfinite(unweighted_rms_dbfs)
+        else float("-inf")
+    )
+    estimated_laeq_dba = (
+        a_weighted_rms_dbfs + SPL_CALIBRATION_OFFSET_DB
+        if np.isfinite(a_weighted_rms_dbfs)
+        else float("-inf")
+    )
+
+    return EstimatedSoundLevelMetrics(
+        calibration_offset_db=SPL_CALIBRATION_OFFSET_DB,
+        calibration_repeatability_std_db=SPL_CALIBRATION_REPEATABILITY_STD_DB,
+        calibration_frequency_hz=SPL_CALIBRATION_FREQUENCY_HZ,
+        calibration_weighting=SPL_CALIBRATION_WEIGHTING,
+        calibration_reference=SPL_CALIBRATION_REFERENCE,
+        calibration_approximate=SPL_CALIBRATION_APPROXIMATE,
+        unweighted_rms_dbfs=unweighted_rms_dbfs,
+        a_weighted_rms_dbfs=a_weighted_rms_dbfs,
+        estimated_lzeq_dbz=estimated_lzeq_dbz,
+        estimated_laeq_dba=estimated_laeq_dba,
+    )
+
+
+def compute_estimated_sound_level_timeseries(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+    window_s: float = AUDIO_SOUND_LEVEL_WINDOW_S,
+    hop_s: float = AUDIO_SOUND_LEVEL_HOP_S,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute 1-second estimated sound-level features; final partial windows are ignored."""
+    sample_count = len(audio)
+    if sample_count == 0 or sample_rate_hz <= 0:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty, empty, empty, empty
+
+    window_samples = int(round(float(window_s) * float(sample_rate_hz)))
+    hop_samples = int(round(float(hop_s) * float(sample_rate_hz)))
+    if window_samples <= 0 or hop_samples <= 0:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty, empty, empty, empty
+
+    window_samples = min(window_samples, sample_count)
+    starts = list(range(0, sample_count - window_samples + 1, hop_samples))
+    if not starts:
+        starts = [0]
+
+    times = np.empty(len(starts), dtype=np.float64)
+    unweighted_levels = np.empty(len(starts), dtype=np.float64)
+    a_weighted_levels = np.empty(len(starts), dtype=np.float64)
+    estimated_lzeq = np.empty(len(starts), dtype=np.float64)
+    estimated_laeq = np.empty(len(starts), dtype=np.float64)
+
+    for index, start in enumerate(starts):
+        frame = audio[start:start + window_samples]
+        times[index] = (start + (len(frame) / 2.0)) / float(sample_rate_hz)
+        _, z_dbfs = compute_unweighted_rms_dbfs(frame)
+        _, a_dbfs = compute_a_weighted_rms_dbfs(frame, sample_rate_hz)
+        unweighted_levels[index] = z_dbfs
+        a_weighted_levels[index] = a_dbfs
+        estimated_lzeq[index] = (
+            z_dbfs + SPL_CALIBRATION_OFFSET_DB if np.isfinite(z_dbfs) else float("-inf")
+        )
+        estimated_laeq[index] = (
+            a_dbfs + SPL_CALIBRATION_OFFSET_DB if np.isfinite(a_dbfs) else float("-inf")
+        )
+
+    return times, unweighted_levels, a_weighted_levels, estimated_lzeq, estimated_laeq
+
+
+def write_estimated_sound_level_csv(
+    filename: Path,
+    time_center_s: np.ndarray,
+    unweighted_level_dbfs: np.ndarray,
+    a_weighted_level_dbfs: np.ndarray,
+    estimated_lzeq_dbz: np.ndarray,
+    estimated_laeq_dba: np.ndarray,
+) -> bool:
+    """Write 1-second estimated sound-level features without raw PCM samples."""
+    if len(time_center_s) == 0:
+        print("No sound-level time windows available; skipping sound-level CSV.")
+        return False
+
+    fieldnames = [
+        "time_center_s",
+        "unweighted_rms_dbfs",
+        "a_weighted_rms_dbfs",
+        "estimated_lzeq_dbz",
+        "estimated_laeq_dba",
+        "calibration_offset_db",
+        "calibration_approximate",
+    ]
+    with filename.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row_index in range(len(time_center_s)):
+            writer.writerow(
+                {
+                    "time_center_s": f"{time_center_s[row_index]:.6f}",
+                    "unweighted_rms_dbfs": _format_number(unweighted_level_dbfs[row_index], 6),
+                    "a_weighted_rms_dbfs": _format_number(a_weighted_level_dbfs[row_index], 6),
+                    "estimated_lzeq_dbz": _format_number(estimated_lzeq_dbz[row_index], 6),
+                    "estimated_laeq_dba": _format_number(estimated_laeq_dba[row_index], 6),
+                    "calibration_offset_db": f"{SPL_CALIBRATION_OFFSET_DB:.2f}",
+                    "calibration_approximate": str(SPL_CALIBRATION_APPROXIMATE),
+                }
+            )
+
+    print(f"Audio sound-level CSV saved to: {filename}")
+    return True
+
+
+def plot_estimated_sound_level_timeseries(
+    filename: Path,
+    time_center_s: np.ndarray,
+    estimated_lzeq_dbz: np.ndarray,
+    estimated_laeq_dba: np.ndarray,
+) -> Path | None:
+    """Plot approximate estimated Z and A sound pressure levels over time."""
+    if len(time_center_s) == 0:
+        print("No sound-level time windows available; skipping estimated sound-level plot.")
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(time_center_s, estimated_lzeq_dbz, label="Estimated LZeq [dBZ]", linewidth=1.2)
+    ax.plot(time_center_s, estimated_laeq_dba, label="Estimated LAeq [dBA]", linewidth=1.2)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Estimated sound pressure level [dB]")
+    ax.set_title("Estimated sound pressure level over time")
+    ax.grid(True)
+    ax.legend()
+    info_text = (
+        "Approximate smartphone calibration\n"
+        f"Offset: {SPL_CALIBRATION_OFFSET_DB:.2f} dB\n"
+        f"Reference weighting: {SPL_CALIBRATION_WEIGHTING}\n"
+        f"Calibration frequency: {SPL_CALIBRATION_FREQUENCY_HZ:.0f} Hz"
+    )
+    ax.text(
+        0.01,
+        0.02,
+        info_text,
+        transform=ax.transAxes,
+        fontsize=8,
+        va="bottom",
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "0.7"},
+    )
+    fig.savefig(
+        filename,
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+    print(f"Estimated sound-level plot saved to: {filename}")
+    return filename
+
+
+def _sound_level_report_lines(sound_metrics: EstimatedSoundLevelMetrics) -> list[str]:
+    return [
+        "",
+        "Estimated acoustic sound levels",
+        f"Calibration offset [dB]: {sound_metrics.calibration_offset_db:.2f}",
+        (
+            "Calibration repeatability std [dB]: "
+            f"{sound_metrics.calibration_repeatability_std_db:.2f}"
+        ),
+        f"Calibration reference: {sound_metrics.calibration_reference}",
+        f"Calibration weighting: {sound_metrics.calibration_weighting}",
+        f"Calibration frequency [Hz]: {sound_metrics.calibration_frequency_hz:.1f}",
+        f"Calibration approximate: {sound_metrics.calibration_approximate}",
+        "",
+        f"Unweighted RMS level [dBFS]: {_format_db(sound_metrics.unweighted_rms_dbfs)}",
+        f"A-weighted RMS level [dBFS]: {_format_db(sound_metrics.a_weighted_rms_dbfs)}",
+        "",
+        f"Estimated LZeq [dBZ]: {_format_db(sound_metrics.estimated_lzeq_dbz, 'dBZ')}",
+        f"Estimated LAeq [dBA]: {_format_db(sound_metrics.estimated_laeq_dba, 'dBA')}",
+        "",
+        (
+            "These sound pressure levels are approximate estimates based on\n"
+            "a smartphone Z-weighted calibration at 1000 Hz and are not\n"
+            "certified sound-level-meter measurements."
+        ),
+    ]
+
+
+def print_estimated_sound_level_metrics(sound_metrics: EstimatedSoundLevelMetrics) -> None:
+    """Print approximate acoustic estimates to the terminal."""
+    print("Estimated acoustic sound levels:")
+    print(f"  Unweighted RMS level [dBFS]: {_format_db(sound_metrics.unweighted_rms_dbfs)}")
+    print(f"  A-weighted RMS level [dBFS]: {_format_db(sound_metrics.a_weighted_rms_dbfs)}")
+    print(f"  Estimated LZeq [dBZ]: {_format_db(sound_metrics.estimated_lzeq_dbz, 'dBZ')}")
+    print(f"  Estimated LAeq [dBA]: {_format_db(sound_metrics.estimated_laeq_dba, 'dBA')}")
+    print(f"  Calibration offset [dB]: {sound_metrics.calibration_offset_db:.2f}")
+    status = "approximate" if sound_metrics.calibration_approximate else "certified"
+    print(f"  Calibration status: {status}")
 
 
 def write_amplified_wav_int16_mono(
@@ -872,6 +1217,15 @@ def analyze_and_export_audio(
         return None
 
     metrics = compute_audio_metrics(audio, sample_rate_hz)
+    sound_metrics = compute_estimated_sound_level_metrics(audio, sample_rate_hz)
+    (
+        sound_time_center_s,
+        sound_unweighted_dbfs,
+        sound_a_weighted_dbfs,
+        sound_estimated_lzeq_dbz,
+        sound_estimated_laeq_dba,
+    ) = compute_estimated_sound_level_timeseries(audio, sample_rate_hz)
+
     write_wav_int16_mono(original_wav_filename, audio.tobytes(), sample_rate_hz)
     print(f"Audio WAV saved to: {original_wav_filename}")
 
@@ -898,10 +1252,33 @@ def analyze_and_export_audio(
     plot_audio_spectrogram(audio, sample_rate_hz, output_prefix)
     plot_audio_histogram(audio, metrics, output_prefix)
 
+    sound_level_plot_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_estimated_sound_level.png"
+    )
+    plot_estimated_sound_level_timeseries(
+        sound_level_plot_filename,
+        sound_time_center_s,
+        sound_estimated_lzeq_dbz,
+        sound_estimated_laeq_dba,
+    )
+
+    sound_level_csv_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_sound_level_1s.csv"
+    )
+    write_estimated_sound_level_csv(
+        sound_level_csv_filename,
+        sound_time_center_s,
+        sound_unweighted_dbfs,
+        sound_a_weighted_dbfs,
+        sound_estimated_lzeq_dbz,
+        sound_estimated_laeq_dba,
+    )
+
     metrics_filename = output_prefix.with_name(output_prefix.name + "_audio_metrics.txt")
-    write_audio_metrics_report(metrics_filename, metrics)
-    append_audio_metrics_to_summary(summary_filename, metrics)
+    write_audio_metrics_report(metrics_filename, metrics, sound_metrics)
+    append_audio_metrics_to_summary(summary_filename, metrics, sound_metrics)
     print_audio_metrics(metrics)
+    print_estimated_sound_level_metrics(sound_metrics)
     return metrics
 
 

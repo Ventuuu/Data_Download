@@ -1980,31 +1980,31 @@ def plot_imu_data(df: pd.DataFrame, output_prefix: Path) -> None:
     else:
         x_label = "Time [s]"
 
-    plt.figure(figsize=(12, 5))
-    plt.plot(t, df["acc_x_g"], label="Acc X")
-    plt.plot(t, df["acc_y_g"], label="Acc Y")
-    plt.plot(t, df["acc_z_g"], label="Acc Z")
-    plt.xlabel(x_label)
-    plt.ylabel("Acceleration [g]")
-    plt.title("Accelerometer")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
+    fig_acc, ax_acc = plt.subplots(figsize=(12, 5))
+    ax_acc.plot(t, df["acc_x_g"], label="Acc X")
+    ax_acc.plot(t, df["acc_y_g"], label="Acc Y")
+    ax_acc.plot(t, df["acc_z_g"], label="Acc Z")
+    ax_acc.set_xlabel(x_label)
+    ax_acc.set_ylabel("Acceleration [g]")
+    ax_acc.set_title("Accelerometer")
+    ax_acc.grid(True)
+    ax_acc.legend()
     acc_png = output_prefix.with_name(output_prefix.name + "_accelerometer.png")
-    plt.savefig(acc_png, dpi=200)
+    fig_acc.savefig(acc_png, dpi=200, bbox_inches="tight")
+    plt.close(fig_acc)
 
-    plt.figure(figsize=(12, 5))
-    plt.plot(t, df["gyro_x_dps"], label="Gyro X")
-    plt.plot(t, df["gyro_y_dps"], label="Gyro Y")
-    plt.plot(t, df["gyro_z_dps"], label="Gyro Z")
-    plt.xlabel(x_label)
-    plt.ylabel("Angular rate [deg/s]")
-    plt.title("Gyroscope")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
+    fig_gyro, ax_gyro = plt.subplots(figsize=(12, 5))
+    ax_gyro.plot(t, df["gyro_x_dps"], label="Gyro X")
+    ax_gyro.plot(t, df["gyro_y_dps"], label="Gyro Y")
+    ax_gyro.plot(t, df["gyro_z_dps"], label="Gyro Z")
+    ax_gyro.set_xlabel(x_label)
+    ax_gyro.set_ylabel("Angular rate [deg/s]")
+    ax_gyro.set_title("Gyroscope")
+    ax_gyro.grid(True)
+    ax_gyro.legend()
     gyro_png = output_prefix.with_name(output_prefix.name + "_gyroscope.png")
-    plt.savefig(gyro_png, dpi=200)
+    fig_gyro.savefig(gyro_png, dpi=200, bbox_inches="tight")
+    plt.close(fig_gyro)
 
 
 def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
@@ -2041,16 +2041,16 @@ def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
             f"Duration: {row['acquisition_duration_ms']} ms"
         )
 
-        plt.figure(figsize=(10, 5))
-        plt.bar(x_labels, values)
-        plt.ylim(0, 1.05)
-        plt.xlabel("Channel and central wavelength")
-        plt.ylabel("Normalized response")
-        plt.title(title)
-        plt.grid(axis="y", alpha=0.35)
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.bar(x_labels, values)
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("Channel and central wavelength")
+        ax.set_ylabel("Normalized response")
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.35)
         light_png = output_prefix.with_name(output_prefix.name + suffix)
-        plt.savefig(light_png, dpi=200)
+        fig.savefig(light_png, dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
         print(f"Ambient light index: {row['clear_mean_counts']} counts")
         print(f"Light level: {row['light_level_label']}")
@@ -2160,6 +2160,7 @@ def plot_light_raw_channels(
             dpi=200,
             bbox_inches="tight",
         )
+        plt.close(fig)
 
         print(f"Raw light channel plot saved to: {output_file}")
 
@@ -2198,6 +2199,7 @@ def plot_light_raw_channels(
         dpi=200,
         bbox_inches="tight",
     )
+    plt.close(fig_all)
 
     print(f"Combined raw light plot saved to: {all_channels_file}")
 
@@ -2265,6 +2267,7 @@ def plot_light_raw_channels(
         dpi=200,
         bbox_inches="tight",
     )
+    plt.close(fig_nir)
 
     print(f"NIR plot saved to: {nir_file}")
 
@@ -2565,7 +2568,6 @@ def main():
         plot_imu_data(imu_df, output_prefix)
         plot_light_raw_channels(light_raw_df, output_prefix, light_raw_diagnostics)
         plot_light_results(light_df, output_prefix)
-        plt.show()
 
     except Exception as exc:
         messagebox.showerror("Processing error", str(exc))

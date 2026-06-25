@@ -190,6 +190,10 @@ AUDIO_SPECTROGRAM_OVERLAP = 0.75
 AUDIO_SPECTROGRAM_MAX_FREQUENCY_HZ = 12000.0
 AUDIO_SPECTROGRAM_DYNAMIC_RANGE_DB = 80.0
 AUDIO_HISTOGRAM_BINS = 200
+AUDIO_MAGNITUDE_SEGMENT_SAMPLES = 4096
+AUDIO_MAGNITUDE_OVERLAP = 0.5
+AUDIO_MAGNITUDE_MAX_FREQUENCY_HZ = 12000.0
+AUDIO_MAGNITUDE_DBFS_FLOOR = -160.0
 
 def u16_le(data: bytes) -> int:
     return struct.unpack("<H", data)[0]
@@ -603,6 +607,109 @@ def plot_audio_psd(audio: np.ndarray, sample_rate_hz: int, output_prefix: Path) 
     return output_file
 
 
+def _spectral_segment_length(sample_count: int, requested_samples: int) -> int:
+    if sample_count < 2 or requested_samples <= 0:
+        return 0
+    segment_length = min(int(requested_samples), sample_count)
+    if segment_length < requested_samples:
+        segment_length = 2 ** int(np.floor(np.log2(segment_length)))
+    return max(2, segment_length)
+
+
+def compute_average_magnitude_spectrum_dbfs(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+    segment_samples: int = AUDIO_MAGNITUDE_SEGMENT_SAMPLES,
+    overlap: float = AUDIO_MAGNITUDE_OVERLAP,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the average one-sided magnitude spectrum in dBFS."""
+    sample_count = len(audio)
+    if sample_count < 2 or sample_rate_hz <= 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    segment_length = _spectral_segment_length(sample_count, int(segment_samples))
+    if segment_length < 2:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    overlap = min(max(float(overlap), 0.0), 0.95)
+    hop = max(1, int(round(segment_length * (1.0 - overlap))))
+    starts = _frame_starts(sample_count, segment_length, hop)
+    if not starts:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    x = audio.astype(np.float64) / INT16_FULL_SCALE
+    x = x - float(np.mean(x))
+    window = (
+        np.hanning(segment_length)
+        if segment_length >= 3
+        else np.ones(segment_length, dtype=np.float64)
+    )
+    coherent_gain = float(np.sum(window))
+    if coherent_gain <= 0.0:
+        window = np.ones(segment_length, dtype=np.float64)
+        coherent_gain = float(np.sum(window))
+
+    magnitude_accumulator = None
+    for start in starts:
+        segment = x[start:start + segment_length]
+        if len(segment) < segment_length:
+            segment = np.pad(segment, (0, segment_length - len(segment)))
+        spectrum = np.fft.rfft(segment * window)
+        magnitude = np.abs(spectrum) / coherent_gain
+        if segment_length > 1:
+            if segment_length % 2 == 0:
+                magnitude[1:-1] *= 2.0
+            else:
+                magnitude[1:] *= 2.0
+        if magnitude_accumulator is None:
+            magnitude_accumulator = magnitude
+        else:
+            magnitude_accumulator += magnitude
+
+    average_magnitude = magnitude_accumulator / float(len(starts))
+    linear_floor = 10.0 ** (AUDIO_MAGNITUDE_DBFS_FLOOR / 20.0)
+    magnitude_dbfs = 20.0 * np.log10(np.maximum(average_magnitude, linear_floor))
+    frequencies = np.fft.rfftfreq(segment_length, d=1.0 / float(sample_rate_hz))
+    return frequencies, magnitude_dbfs
+
+
+def plot_audio_magnitude_spectrum_dbfs(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+    filename: Path,
+) -> Path | None:
+    """Plot the average magnitude spectrum of the recorded audio."""
+    frequencies, magnitude_dbfs = compute_average_magnitude_spectrum_dbfs(
+        audio,
+        sample_rate_hz,
+    )
+    if len(frequencies) == 0 or len(magnitude_dbfs) == 0:
+        print("Warning: unable to generate audio magnitude spectrum; insufficient valid audio data.")
+        return None
+
+    if np.isnan(magnitude_dbfs).any():
+        print("Warning: audio magnitude spectrum contains NaN values; plot skipped.")
+        return None
+
+    max_frequency = min(AUDIO_MAGNITUDE_MAX_FREQUENCY_HZ, sample_rate_hz / 2.0)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(frequencies, magnitude_dbfs, linewidth=1.1)
+    ax.set_xlim(0.0, max_frequency)
+    ax.set_ylim(AUDIO_MAGNITUDE_DBFS_FLOOR, 0.0)
+    ax.set_xlabel("Frequency [Hz]")
+    ax.set_ylabel("Magnitude [dBFS]")
+    ax.set_title("Average magnitude spectrum of recorded audio")
+    ax.grid(True)
+    fig.savefig(
+        filename,
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+    print(f"Audio magnitude spectrum plot saved to: {filename}")
+    return filename
+
+
 def compute_spectrogram_psd(
     audio: np.ndarray,
     sample_rate_hz: int,
@@ -780,6 +887,14 @@ def analyze_and_export_audio(
     plot_audio_waveform(audio, sample_rate_hz, output_prefix)
     plot_audio_level_dbfs(audio, sample_rate_hz, output_prefix)
     plot_audio_psd(audio, sample_rate_hz, output_prefix)
+    magnitude_spectrum_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_magnitude_spectrum_dbfs.png"
+    )
+    plot_audio_magnitude_spectrum_dbfs(
+        audio,
+        sample_rate_hz,
+        magnitude_spectrum_filename,
+    )
     plot_audio_spectrogram(audio, sample_rate_hz, output_prefix)
     plot_audio_histogram(audio, metrics, output_prefix)
 

@@ -178,6 +178,18 @@ LIGHT_RESULT_COLUMNS = [
 
 DEFAULT_BAUD_RATE = 250000
 DEFAULT_AUDIO_SAMPLE_RATE = 48000
+INT16_FULL_SCALE = 32768.0
+AUDIO_AMPLIFIED_TARGET_DBFS = -1.0
+AUDIO_LEVEL_WINDOW_MS = 50.0
+AUDIO_LEVEL_HOP_MS = 25.0
+AUDIO_DBFS_FLOOR = -160.0
+AUDIO_PSD_SEGMENT_SAMPLES = 4096
+AUDIO_PSD_OVERLAP = 0.5
+AUDIO_SPECTROGRAM_NFFT = 2048
+AUDIO_SPECTROGRAM_OVERLAP = 0.75
+AUDIO_SPECTROGRAM_MAX_FREQUENCY_HZ = 12000.0
+AUDIO_SPECTROGRAM_DYNAMIC_RANGE_DB = 80.0
+AUDIO_HISTOGRAM_BINS = 200
 
 def u16_le(data: bytes) -> int:
     return struct.unpack("<H", data)[0]
@@ -214,12 +226,568 @@ def wait_for_marker(ser: serial.Serial, marker: bytes) -> None:
             return
 
 
+@dataclass
+class AudioMetrics:
+    sample_rate_hz: int
+    sample_count: int
+    duration_s: float
+    minimum_sample: int | None
+    maximum_sample: int | None
+    mean_sample: float
+    dc_offset_counts: float
+    rms_counts: float
+    rms_dbfs: float
+    absolute_peak_counts: float
+    peak_dbfs: float
+    crest_factor: float
+    crest_factor_db: float
+    clipped_sample_count: int
+    clipped_sample_percentage: float
+    amplification_gain_linear: float
+    amplification_gain_db: float
+    amplified_target_peak_dbfs: float
+
+
 def write_wav_int16_mono(filename: Path, pcm_bytes: bytes, sample_rate_hz: int) -> None:
     with wave.open(str(filename), "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(sample_rate_hz)
         wav.writeframes(pcm_bytes)
+
+
+def decode_audio_int16(audio_bytes: bytes) -> np.ndarray:
+    """Decode raw PCM bytes as signed little-endian int16 mono samples."""
+    if len(audio_bytes) % 2 != 0:
+        print("Warning: audio byte count is odd; last byte ignored.")
+        audio_bytes = audio_bytes[:-1]
+    return np.frombuffer(audio_bytes, dtype="<i2")
+
+
+def _db20_from_ratio(ratio: float) -> float:
+    if ratio <= 0.0 or not np.isfinite(ratio):
+        return float("-inf")
+    return float(20.0 * np.log10(ratio))
+
+
+def _db10_from_power(power: np.ndarray) -> np.ndarray:
+    result = np.full(power.shape, float("-inf"), dtype=np.float64)
+    positive = power > 0.0
+    result[positive] = 10.0 * np.log10(power[positive])
+    return result
+
+
+def _format_db(value: float, unit: str = "dBFS") -> str:
+    if np.isneginf(value):
+        return f"-inf {unit}"
+    if np.isposinf(value):
+        return f"inf {unit}"
+    if np.isnan(value):
+        return f"nan {unit}"
+    return f"{value:.3f} {unit}"
+
+
+def _format_number(value: float | int | None, digits: int = 3) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if np.isneginf(value):
+        return "-inf"
+    if np.isposinf(value):
+        return "inf"
+    if np.isnan(value):
+        return "nan"
+    return f"{float(value):.{digits}f}"
+
+
+def compute_audio_metrics(audio: np.ndarray, sample_rate_hz: int) -> AudioMetrics:
+    """Compute global metrics from raw int16 audio samples."""
+    sample_count = int(len(audio))
+    duration_s = sample_count / float(sample_rate_hz) if sample_rate_hz > 0 else 0.0
+
+    if sample_count == 0:
+        target_peak_counts = 32767.0 * (10.0 ** (AUDIO_AMPLIFIED_TARGET_DBFS / 20.0))
+        return AudioMetrics(
+            sample_rate_hz=sample_rate_hz,
+            sample_count=0,
+            duration_s=duration_s,
+            minimum_sample=None,
+            maximum_sample=None,
+            mean_sample=0.0,
+            dc_offset_counts=0.0,
+            rms_counts=0.0,
+            rms_dbfs=float("-inf"),
+            absolute_peak_counts=0.0,
+            peak_dbfs=float("-inf"),
+            crest_factor=0.0,
+            crest_factor_db=float("-inf"),
+            clipped_sample_count=0,
+            clipped_sample_percentage=0.0,
+            amplification_gain_linear=1.0,
+            amplification_gain_db=0.0,
+            amplified_target_peak_dbfs=AUDIO_AMPLIFIED_TARGET_DBFS,
+        )
+
+    audio_float = audio.astype(np.float64)
+    minimum_sample = int(audio.min())
+    maximum_sample = int(audio.max())
+    mean_sample = float(np.mean(audio_float))
+    rms_counts = float(np.sqrt(np.mean(audio_float ** 2)))
+    absolute_peak_counts = float(np.max(np.abs(audio_float)))
+
+    rms_dbfs = _db20_from_ratio(rms_counts / INT16_FULL_SCALE)
+    peak_dbfs = _db20_from_ratio(absolute_peak_counts / INT16_FULL_SCALE)
+    if rms_counts > 0.0 and absolute_peak_counts > 0.0:
+        crest_factor = float(absolute_peak_counts / rms_counts)
+        crest_factor_db = _db20_from_ratio(crest_factor)
+    else:
+        crest_factor = 0.0
+        crest_factor_db = float("-inf")
+
+    clipped_mask = (audio <= -32768) | (audio >= 32767)
+    clipped_sample_count = int(np.count_nonzero(clipped_mask))
+    clipped_sample_percentage = 100.0 * clipped_sample_count / sample_count
+
+    target_peak_counts = 32767.0 * (10.0 ** (AUDIO_AMPLIFIED_TARGET_DBFS / 20.0))
+    if absolute_peak_counts > 0.0:
+        gain = float(target_peak_counts / absolute_peak_counts)
+    else:
+        gain = 1.0
+    gain_db = _db20_from_ratio(gain)
+
+    return AudioMetrics(
+        sample_rate_hz=sample_rate_hz,
+        sample_count=sample_count,
+        duration_s=duration_s,
+        minimum_sample=minimum_sample,
+        maximum_sample=maximum_sample,
+        mean_sample=mean_sample,
+        dc_offset_counts=mean_sample,
+        rms_counts=rms_counts,
+        rms_dbfs=rms_dbfs,
+        absolute_peak_counts=absolute_peak_counts,
+        peak_dbfs=peak_dbfs,
+        crest_factor=crest_factor,
+        crest_factor_db=crest_factor_db,
+        clipped_sample_count=clipped_sample_count,
+        clipped_sample_percentage=clipped_sample_percentage,
+        amplification_gain_linear=gain,
+        amplification_gain_db=gain_db,
+        amplified_target_peak_dbfs=AUDIO_AMPLIFIED_TARGET_DBFS,
+    )
+
+
+def _metrics_report_lines(metrics: AudioMetrics) -> list[str]:
+    return [
+        "Audio metrics",
+        f"Audio sample rate [Hz]: {metrics.sample_rate_hz}",
+        f"Audio sample count: {metrics.sample_count}",
+        f"Audio duration [s]: {metrics.duration_s:.6f}",
+        "",
+        f"Minimum sample [counts]: {_format_number(metrics.minimum_sample)}",
+        f"Maximum sample [counts]: {_format_number(metrics.maximum_sample)}",
+        f"Mean sample / DC offset [counts]: {metrics.mean_sample:.6f}",
+        "",
+        f"RMS amplitude [counts]: {metrics.rms_counts:.6f}",
+        f"RMS level [dBFS]: {_format_db(metrics.rms_dbfs)}",
+        "",
+        f"Absolute peak [counts]: {metrics.absolute_peak_counts:.6f}",
+        f"Peak level [dBFS]: {_format_db(metrics.peak_dbfs)}",
+        "",
+        f"Crest factor [linear]: {metrics.crest_factor:.6f}",
+        f"Crest factor [dB]: {_format_db(metrics.crest_factor_db, 'dB')}",
+        "",
+        f"Clipped samples: {metrics.clipped_sample_count}",
+        f"Clipped samples [%]: {metrics.clipped_sample_percentage:.6f}",
+        "",
+        f"Amplified WAV target peak [dBFS]: {_format_db(metrics.amplified_target_peak_dbfs)}",
+        f"Applied gain [linear]: {metrics.amplification_gain_linear:.9f}",
+        f"Applied gain [dB]: {_format_db(metrics.amplification_gain_db, 'dB')}",
+    ]
+
+
+def write_audio_metrics_report(report_filename: Path, metrics: AudioMetrics) -> None:
+    """Write a standalone text report with raw-signal audio metrics."""
+    report_filename.write_text("\n".join(_metrics_report_lines(metrics)) + "\n", encoding="utf-8")
+    print(f"Audio metrics report saved to: {report_filename}")
+
+
+def append_audio_metrics_to_summary(summary_filename: Path, metrics: AudioMetrics) -> None:
+    """Append the audio metrics section to the existing parser summary."""
+    lines = ["", "Audio metrics summary"]
+    lines.extend(_metrics_report_lines(metrics)[1:])
+    with summary_filename.open("a", encoding="utf-8") as summary_file:
+        summary_file.write("\n".join(lines) + "\n")
+
+
+def print_audio_metrics(metrics: AudioMetrics) -> None:
+    """Print the main audio metrics to the terminal."""
+    print("Audio metrics:")
+    print(f"  Duration: {metrics.duration_s:.6f} s")
+    print(f"  Samples: {metrics.sample_count}")
+    print(f"  RMS: {metrics.rms_counts:.3f} counts ({_format_db(metrics.rms_dbfs)})")
+    print(f"  Peak: {metrics.absolute_peak_counts:.3f} counts ({_format_db(metrics.peak_dbfs)})")
+    print(
+        "  Amplified WAV gain: "
+        f"{metrics.amplification_gain_linear:.9f} ({_format_db(metrics.amplification_gain_db, 'dB')})"
+    )
+    print(
+        "  Clipped samples: "
+        f"{metrics.clipped_sample_count} ({metrics.clipped_sample_percentage:.6f}%)"
+    )
+
+
+def write_amplified_wav_int16_mono(
+    filename: Path,
+    audio: np.ndarray,
+    sample_rate_hz: int,
+    gain: float,
+) -> None:
+    """Write a peak-normalized int16 mono WAV without changing raw samples."""
+    audio_float = audio.astype(np.float64)
+    amplified_float = audio_float * gain
+    amplified_int16 = np.clip(np.rint(amplified_float), -32768, 32767).astype("<i2")
+    write_wav_int16_mono(filename, amplified_int16.tobytes(), sample_rate_hz)
+
+
+def _frame_starts(sample_count: int, window_samples: int, hop_samples: int) -> list[int]:
+    if sample_count <= 0:
+        return []
+    window_samples = max(1, min(window_samples, sample_count))
+    hop_samples = max(1, hop_samples)
+    return list(range(0, sample_count - window_samples + 1, hop_samples)) or [0]
+
+
+def plot_audio_waveform(audio: np.ndarray, sample_rate_hz: int, output_prefix: Path) -> Path | None:
+    """Plot the raw PCM int16 waveform in the time domain."""
+    if len(audio) == 0:
+        print("No audio data available; skipping audio waveform plot.")
+        return None
+
+    t = np.arange(len(audio), dtype=np.float64) / float(sample_rate_hz)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(t, audio.astype(np.float64), linewidth=0.8)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("PCM amplitude [int16]")
+    ax.set_title("Audio waveform")
+    ax.grid(True)
+    audio_png = output_prefix.with_name(output_prefix.name + "_audio_waveform.png")
+    fig.savefig(audio_png, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Audio waveform plot saved to: {audio_png}")
+    return audio_png
+
+
+def plot_audio_level_dbfs(audio: np.ndarray, sample_rate_hz: int, output_prefix: Path) -> Path | None:
+    """Plot short-time RMS and peak levels in dBFS from raw samples."""
+    sample_count = len(audio)
+    if sample_count == 0:
+        print("No audio data available; skipping audio level plot.")
+        return None
+
+    window_samples = max(1, int(round(sample_rate_hz * AUDIO_LEVEL_WINDOW_MS / 1000.0)))
+    hop_samples = max(1, int(round(sample_rate_hz * AUDIO_LEVEL_HOP_MS / 1000.0)))
+    window_samples = min(window_samples, sample_count)
+    starts = _frame_starts(sample_count, window_samples, hop_samples)
+    audio_float = audio.astype(np.float64)
+
+    times = np.empty(len(starts), dtype=np.float64)
+    rms_dbfs = np.empty(len(starts), dtype=np.float64)
+    peak_dbfs = np.empty(len(starts), dtype=np.float64)
+
+    for index, start in enumerate(starts):
+        frame = audio_float[start:start + window_samples]
+        center = start + (len(frame) / 2.0)
+        times[index] = center / float(sample_rate_hz)
+        rms = float(np.sqrt(np.mean(frame ** 2))) if len(frame) else 0.0
+        peak = float(np.max(np.abs(frame))) if len(frame) else 0.0
+        rms_dbfs[index] = _db20_from_ratio(rms / INT16_FULL_SCALE)
+        peak_dbfs[index] = _db20_from_ratio(peak / INT16_FULL_SCALE)
+
+    rms_plot = np.maximum(rms_dbfs, AUDIO_DBFS_FLOOR)
+    peak_plot = np.maximum(peak_dbfs, AUDIO_DBFS_FLOOR)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(times, rms_plot, label="RMS level", linewidth=1.2)
+    ax.plot(times, peak_plot, label="Peak level", linewidth=1.2)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Level [dBFS]")
+    ax.set_ylim(AUDIO_DBFS_FLOOR, 0.0)
+    ax.set_title("Audio level over time")
+    ax.grid(True)
+    ax.legend()
+    output_file = output_prefix.with_name(output_prefix.name + "_audio_level_dbfs.png")
+    fig.savefig(output_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Audio level plot saved to: {output_file}")
+    return output_file
+
+
+def compute_welch_psd(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+    segment_samples: int = AUDIO_PSD_SEGMENT_SAMPLES,
+    overlap: float = AUDIO_PSD_OVERLAP,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute one-sided Welch PSD in full-scale squared per Hz."""
+    sample_count = len(audio)
+    if sample_count == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    nperseg = max(1, min(int(segment_samples), sample_count))
+    overlap = min(max(float(overlap), 0.0), 0.95)
+    hop = max(1, int(round(nperseg * (1.0 - overlap))))
+    starts = _frame_starts(sample_count, nperseg, hop)
+
+    x = audio.astype(np.float64) / INT16_FULL_SCALE
+    x = x - float(np.mean(x))
+    window = np.hanning(nperseg) if nperseg >= 3 else np.ones(nperseg, dtype=np.float64)
+    window_power = float(np.sum(window ** 2))
+    if window_power == 0.0:
+        window = np.ones(nperseg, dtype=np.float64)
+        window_power = float(np.sum(window ** 2))
+
+    psd_accumulator = None
+    for start in starts:
+        segment = x[start:start + nperseg]
+        if len(segment) < nperseg:
+            segment = np.pad(segment, (0, nperseg - len(segment)))
+        spectrum = np.fft.rfft(segment * window)
+        psd = (np.abs(spectrum) ** 2) / (float(sample_rate_hz) * window_power)
+        if nperseg > 1:
+            if nperseg % 2 == 0:
+                psd[1:-1] *= 2.0
+            else:
+                psd[1:] *= 2.0
+        if psd_accumulator is None:
+            psd_accumulator = psd
+        else:
+            psd_accumulator += psd
+
+    mean_psd = psd_accumulator / float(len(starts))
+    frequencies = np.fft.rfftfreq(nperseg, d=1.0 / float(sample_rate_hz))
+    return frequencies, mean_psd
+
+
+def plot_audio_psd(audio: np.ndarray, sample_rate_hz: int, output_prefix: Path) -> Path | None:
+    """Plot Welch PSD in dBFS/Hz."""
+    if len(audio) == 0:
+        print("No audio data available; skipping audio PSD plot.")
+        return None
+
+    frequencies, psd = compute_welch_psd(audio, sample_rate_hz)
+    if len(frequencies) == 0:
+        return None
+
+    psd_db = _db10_from_power(psd)
+    finite = np.isfinite(psd_db)
+    if finite.any():
+        plot_psd_db = psd_db.copy()
+        plot_psd_db[~finite] = float(np.min(psd_db[finite]) - 20.0)
+    else:
+        plot_psd_db = np.full_like(psd_db, AUDIO_DBFS_FLOOR)
+
+    max_frequency = min(12000.0, sample_rate_hz / 2.0)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(frequencies, plot_psd_db, linewidth=1.1)
+    ax.set_xlim(0.0, max_frequency)
+    ax.set_xlabel("Frequency [Hz]")
+    ax.set_ylabel("PSD [dBFS/Hz]")
+    ax.set_title("Audio PSD (Welch)")
+    ax.grid(True)
+    output_file = output_prefix.with_name(output_prefix.name + "_audio_psd.png")
+    fig.savefig(output_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Audio PSD plot saved to: {output_file}")
+    return output_file
+
+
+def compute_spectrogram_psd(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+    nfft: int = AUDIO_SPECTROGRAM_NFFT,
+    overlap: float = AUDIO_SPECTROGRAM_OVERLAP,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute a one-sided PSD spectrogram in dBFS/Hz."""
+    sample_count = len(audio)
+    if sample_count == 0:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty, np.empty((0, 0), dtype=np.float64)
+
+    nfft = max(1, min(int(nfft), sample_count))
+    overlap = min(max(float(overlap), 0.0), 0.95)
+    hop = max(1, int(round(nfft * (1.0 - overlap))))
+    starts = _frame_starts(sample_count, nfft, hop)
+
+    x = audio.astype(np.float64) / INT16_FULL_SCALE
+    x = x - float(np.mean(x))
+    window = np.hanning(nfft) if nfft >= 3 else np.ones(nfft, dtype=np.float64)
+    window_power = float(np.sum(window ** 2))
+    if window_power == 0.0:
+        window = np.ones(nfft, dtype=np.float64)
+        window_power = float(np.sum(window ** 2))
+
+    columns = []
+    times = np.empty(len(starts), dtype=np.float64)
+    for index, start in enumerate(starts):
+        segment = x[start:start + nfft]
+        if len(segment) < nfft:
+            segment = np.pad(segment, (0, nfft - len(segment)))
+        spectrum = np.fft.rfft(segment * window)
+        psd = (np.abs(spectrum) ** 2) / (float(sample_rate_hz) * window_power)
+        if nfft > 1:
+            if nfft % 2 == 0:
+                psd[1:-1] *= 2.0
+            else:
+                psd[1:] *= 2.0
+        columns.append(_db10_from_power(psd))
+        times[index] = (start + (nfft / 2.0)) / float(sample_rate_hz)
+
+    frequencies = np.fft.rfftfreq(nfft, d=1.0 / float(sample_rate_hz))
+    spectrogram_db = np.column_stack(columns)
+    return times, frequencies, spectrogram_db
+
+
+def plot_audio_spectrogram(audio: np.ndarray, sample_rate_hz: int, output_prefix: Path) -> Path | None:
+    """Plot a PSD spectrogram in dBFS/Hz."""
+    if len(audio) == 0:
+        print("No audio data available; skipping audio spectrogram.")
+        return None
+
+    times, frequencies, spectrogram_db = compute_spectrogram_psd(audio, sample_rate_hz)
+    if spectrogram_db.size == 0:
+        return None
+
+    max_frequency = min(AUDIO_SPECTROGRAM_MAX_FREQUENCY_HZ, sample_rate_hz / 2.0)
+    frequency_mask = frequencies <= max_frequency
+    frequencies = frequencies[frequency_mask]
+    spectrogram_db = spectrogram_db[frequency_mask, :]
+
+    finite = np.isfinite(spectrogram_db)
+    if finite.any():
+        vmax = float(np.max(spectrogram_db[finite]))
+        vmin = vmax - AUDIO_SPECTROGRAM_DYNAMIC_RANGE_DB
+    else:
+        vmax = 0.0
+        vmin = -AUDIO_SPECTROGRAM_DYNAMIC_RANGE_DB
+    plot_data = np.maximum(spectrogram_db, vmin)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    extent = [
+        float(times[0]) if len(times) else 0.0,
+        float(times[-1]) if len(times) else 0.0,
+        float(frequencies[0]) if len(frequencies) else 0.0,
+        float(frequencies[-1]) if len(frequencies) else 0.0,
+    ]
+    image = ax.imshow(
+        plot_data,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Frequency [Hz]")
+    ax.set_title("Audio spectrogram")
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("Power spectral density [dBFS/Hz]")
+    output_file = output_prefix.with_name(output_prefix.name + "_audio_spectrogram.png")
+    fig.savefig(output_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Audio spectrogram saved to: {output_file}")
+    return output_file
+
+
+def plot_audio_histogram(
+    audio: np.ndarray,
+    metrics: AudioMetrics,
+    output_prefix: Path,
+) -> Path | None:
+    """Plot the raw int16 sample distribution."""
+    if len(audio) == 0:
+        print("No audio data available; skipping audio histogram.")
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.hist(audio.astype(np.float64), bins=AUDIO_HISTOGRAM_BINS)
+    ax.axvline(
+        metrics.mean_sample,
+        color="red",
+        linestyle="--",
+        linewidth=1.2,
+        label=f"Mean/DC offset = {metrics.mean_sample:.3f}",
+    )
+    ax.set_xlabel("PCM amplitude [int16 counts]")
+    ax.set_ylabel("Sample count")
+    ax.set_title("Audio sample histogram")
+    ax.grid(True, axis="y", alpha=0.35)
+    ax.legend()
+    output_file = output_prefix.with_name(output_prefix.name + "_audio_histogram.png")
+    fig.savefig(output_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Audio histogram saved to: {output_file}")
+    return output_file
+
+
+def _audio_output_prefix_from_wav(original_wav_filename: Path) -> Path:
+    if original_wav_filename.name.endswith("_audio.wav"):
+        prefix_name = original_wav_filename.name[:-len("_audio.wav")]
+        return original_wav_filename.with_name(prefix_name)
+    return original_wav_filename.with_suffix("")
+
+
+def analyze_and_export_audio(
+    audio_bytes: bytes,
+    sample_rate_hz: int,
+    original_wav_filename: Path,
+    summary_filename: Path,
+) -> AudioMetrics | None:
+    """Decode raw audio once, export WAVs, plots, metrics and summary section."""
+    if not audio_bytes:
+        message = "No audio data available; skipping audio WAV amplification, plots and metrics."
+        print(message)
+        with summary_filename.open("a", encoding="utf-8") as summary_file:
+            summary_file.write("\nAudio metrics summary\n")
+            summary_file.write("Audio analysis skipped: no audio data available.\n")
+        return None
+
+    output_prefix = _audio_output_prefix_from_wav(original_wav_filename)
+    audio = decode_audio_int16(audio_bytes)
+    if len(audio) == 0:
+        message = "No complete int16 audio samples available; skipping audio exports."
+        print(message)
+        with summary_filename.open("a", encoding="utf-8") as summary_file:
+            summary_file.write("\nAudio metrics summary\n")
+            summary_file.write("Audio analysis skipped: no complete int16 samples available.\n")
+        return None
+
+    metrics = compute_audio_metrics(audio, sample_rate_hz)
+    write_wav_int16_mono(original_wav_filename, audio.tobytes(), sample_rate_hz)
+    print(f"Audio WAV saved to: {original_wav_filename}")
+
+    amplified_wav_filename = output_prefix.with_name(output_prefix.name + "_audio_amplified.wav")
+    write_amplified_wav_int16_mono(
+        amplified_wav_filename,
+        audio,
+        sample_rate_hz,
+        metrics.amplification_gain_linear,
+    )
+    print(f"Amplified audio WAV saved to: {amplified_wav_filename}")
+
+    plot_audio_waveform(audio, sample_rate_hz, output_prefix)
+    plot_audio_level_dbfs(audio, sample_rate_hz, output_prefix)
+    plot_audio_psd(audio, sample_rate_hz, output_prefix)
+    plot_audio_spectrogram(audio, sample_rate_hz, output_prefix)
+    plot_audio_histogram(audio, metrics, output_prefix)
+
+    metrics_filename = output_prefix.with_name(output_prefix.name + "_audio_metrics.txt")
+    write_audio_metrics_report(metrics_filename, metrics)
+    append_audio_metrics_to_summary(summary_filename, metrics)
+    print_audio_metrics(metrics)
+    return metrics
 
 
 def receive_and_save_data(com_port: str, baud_rate: int, bin_filename: Path, timeout_s: float = 10.0) -> int:
@@ -1186,8 +1754,6 @@ def parse_nand_dump(
     light_raw_df.to_csv(light_raw_csv_filename, index=False)
     light_df.to_csv(light_csv_filename, index=False)
 
-    write_wav_int16_mono(wav_filename, bytes(audio_bytes), audio_sample_rate_hz)
-
     report_written = write_light_raw_diagnostics_report(
         report_filename=light_raw_diagnostics_filename,
         bin_filename=bin_filename,
@@ -1269,12 +1835,19 @@ def parse_nand_dump(
         )
 
     summary_filename.write_text(summary, encoding="utf-8")
+    audio_metrics = analyze_and_export_audio(
+        audio_bytes=bytes(audio_bytes),
+        sample_rate_hz=audio_sample_rate_hz,
+        original_wav_filename=wav_filename,
+        summary_filename=summary_filename,
+    )
 
     print(summary)
     print(f"IMU CSV saved to: {imu_csv_filename}")
     print(f"Light raw CSV saved to: {light_raw_csv_filename}")
     print(f"Legacy light CSV saved to: {light_csv_filename}")
-    print(f"Audio WAV saved to: {wav_filename}")
+    if audio_metrics is not None:
+        print(f"Audio WAV saved to: {wav_filename}")
     print(f"Summary saved to: {summary_filename}")
 
     return imu_df, light_raw_df, light_df, bytes(audio_bytes), stats, light_raw_diagnostics
@@ -1584,29 +2157,6 @@ def plot_light_raw_channels(
     print(f"NIR maximum sample index: {nir_max_sample}")
     print(f"NIR maximum time: {nir_max_time:.3f} s")
 
-def plot_audio_waveform(audio_bytes: bytes, sample_rate_hz: int, output_prefix: Path) -> None:
-    if not audio_bytes:
-        print("No audio data available; skipping audio plot.")
-        return
-
-    if len(audio_bytes) % 2 != 0:
-        print("Warning: audio byte count is odd; last byte ignored.")
-        audio_bytes = audio_bytes[:-1]
-
-    audio = np.frombuffer(audio_bytes, dtype="<i2")
-    t = np.arange(len(audio), dtype=float) / float(sample_rate_hz)
-
-    plt.figure(figsize=(12, 4))
-    plt.plot(t, audio)
-    plt.xlabel("Time [s]")
-    plt.ylabel("PCM amplitude [int16]")
-    plt.title("Audio waveform")
-    plt.grid(True)
-    plt.tight_layout()
-    audio_png = output_prefix.with_name(output_prefix.name + "_audio_waveform.png")
-    plt.savefig(audio_png, dpi=200)
-
-
 def gui_select_com_and_folder():
     root = Tk()
     root.title("Smart Eyewear NAND Logger")
@@ -1900,7 +2450,6 @@ def main():
         plot_imu_data(imu_df, output_prefix)
         plot_light_raw_channels(light_raw_df, output_prefix, light_raw_diagnostics)
         plot_light_results(light_df, output_prefix)
-        plot_audio_waveform(audio_bytes, audio_sample_rate, output_prefix)
         plt.show()
 
     except Exception as exc:

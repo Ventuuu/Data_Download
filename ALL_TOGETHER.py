@@ -100,7 +100,7 @@ LIGHT_LEVEL_LABELS = {
 # firmware exposure settings change. The classifier rescales the measured
 # Clear counts to the reference exposure below, so the thresholds remain easy
 # to tune in one place.
-LIGHT_SENSOR_GAIN = 64.0
+LIGHT_SENSOR_GAIN = 32.0
 LIGHT_SENSOR_INTEGRATION_TIME_MS = 27.8
 
 LIGHT_CLASSIFICATION_REFERENCE_GAIN = 64.0

@@ -205,6 +205,49 @@ SPL_CALIBRATION_PHONE_LEVELS_DBZ = (59.0, 68.0, 76.0)
 SPL_CALIBRATION_SENSOR_LEVELS_DBFS = (-56.763, -46.350, -40.499)
 AUDIO_SOUND_LEVEL_WINDOW_S = 1.0
 AUDIO_SOUND_LEVEL_HOP_S = 1.0
+NIOSH_REFERENCE_LEVEL_DBA = 85.0
+NIOSH_REFERENCE_DURATION_HOURS = 8.0
+NIOSH_EXCHANGE_RATE_DB = 3.0
+MIN_SOUND_CLASSIFICATION_DURATION_S = 0.5
+SHORT_ACQUISITION_THRESHOLD_S = 10.0
+SOUND_ENVIRONMENT_THRESHOLDS_DBA = (
+    35.0,
+    45.0,
+    55.0,
+    65.0,
+    75.0,
+    85.0,
+)
+SOUND_ENVIRONMENT_CATEGORIES = (
+    ("very_quiet", "Very quiet", "Minimal background noise"),
+    ("quiet", "Quiet", "Low background noise"),
+    (
+        "moderate",
+        "Moderate",
+        "Clearly audible but generally comfortable environment",
+    ),
+    (
+        "lively",
+        "Lively",
+        "Conversations or sustained activity are clearly present",
+    ),
+    (
+        "noisy",
+        "Noisy",
+        "Sustained and potentially distracting sound environment",
+    ),
+    ("very_noisy", "Very noisy", "Prolonged exposure should be monitored"),
+    (
+        "high_exposure",
+        "High exposure level",
+        "Potential hearing risk depending on exposure duration",
+    ),
+)
+INVALID_SOUND_ENVIRONMENT_CATEGORY = (
+    "invalid",
+    "Unavailable",
+    "Sound level estimate unavailable",
+)
 
 def u16_le(data: bytes) -> int:
     return struct.unpack("<H", data)[0]
@@ -275,6 +318,24 @@ class EstimatedSoundLevelMetrics:
     a_weighted_rms_dbfs: float
     estimated_lzeq_dbz: float
     estimated_laeq_dba: float
+
+
+@dataclass
+class SoundEnvironmentAssessment:
+    estimated_laeq_dba: float
+    acquisition_duration_s: float
+    category_code: str
+    category_label: str
+    category_description: str
+    niosh_max_exposure_hours: float
+    niosh_max_exposure_minutes: float
+    niosh_recorded_dose_percent: float
+    niosh_reference_level_dba: float
+    niosh_exchange_rate_db: float
+    warning_level: str
+    warning_message: str
+    short_acquisition: bool
+    estimate_valid: bool
 
 
 def write_wav_int16_mono(filename: Path, pcm_bytes: bytes, sample_rate_hz: int) -> None:
@@ -440,11 +501,14 @@ def write_audio_metrics_report(
     report_filename: Path,
     metrics: AudioMetrics,
     sound_metrics: EstimatedSoundLevelMetrics | None = None,
+    sound_assessment: SoundEnvironmentAssessment | None = None,
 ) -> None:
     """Write a standalone text report with raw-signal audio metrics."""
     lines = _metrics_report_lines(metrics)
     if sound_metrics is not None:
         lines.extend(_sound_level_report_lines(sound_metrics))
+    if sound_assessment is not None:
+        lines.extend(_sound_environment_assessment_report_lines(sound_assessment))
     report_filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Audio metrics report saved to: {report_filename}")
 
@@ -453,6 +517,7 @@ def append_audio_metrics_to_summary(
     summary_filename: Path,
     metrics: AudioMetrics,
     sound_metrics: EstimatedSoundLevelMetrics | None = None,
+    sound_assessment: SoundEnvironmentAssessment | None = None,
 ) -> None:
     """Append the audio metrics section to the existing parser summary."""
     lines = ["", "Audio metrics summary"]
@@ -478,6 +543,32 @@ def append_audio_metrics_to_summary(
                 "Calibration status: approximate"
                 if sound_metrics.calibration_approximate
                 else "Calibration status: certified",
+            ]
+        )
+    if sound_assessment is not None:
+        lines.extend(
+            [
+                "",
+                "Sound environment classification",
+                (
+                    "Estimated LAeq [dBA]: "
+                    f"{_format_db(sound_assessment.estimated_laeq_dba, 'dBA')}"
+                ),
+                f"Environment category: {sound_assessment.category_label}",
+                (
+                    "Indicative NIOSH maximum exposure time: "
+                    f"{format_exposure_duration(sound_assessment.niosh_max_exposure_hours)}"
+                ),
+                (
+                    "Recorded dose [%]: "
+                    f"{_format_number(sound_assessment.niosh_recorded_dose_percent, 3)}"
+                ),
+                f"Warning level: {sound_assessment.warning_level}",
+                f"Warning message: {sound_assessment.warning_message}",
+                (
+                    "Short acquisition status: "
+                    f"{sound_assessment.short_acquisition}"
+                ),
             ]
         )
     with summary_filename.open("a", encoding="utf-8") as summary_file:
@@ -661,6 +752,196 @@ def compute_estimated_sound_level_timeseries(
     return times, unweighted_levels, a_weighted_levels, estimated_lzeq, estimated_laeq
 
 
+def classify_sound_environment(
+    estimated_laeq_dba: float,
+) -> tuple[str, str, str]:
+    """Classify the acoustic environment from an estimated global LAeq value."""
+    if not np.isfinite(estimated_laeq_dba) or estimated_laeq_dba < 0.0:
+        return INVALID_SOUND_ENVIRONMENT_CATEGORY
+
+    for threshold, category in zip(
+        SOUND_ENVIRONMENT_THRESHOLDS_DBA,
+        SOUND_ENVIRONMENT_CATEGORIES,
+    ):
+        if estimated_laeq_dba < threshold:
+            return category
+    return SOUND_ENVIRONMENT_CATEGORIES[-1]
+
+
+def compute_niosh_max_exposure_hours(laeq_dba: float) -> float:
+    """Compute the indicative NIOSH REL maximum exposure duration in hours."""
+    if not np.isfinite(laeq_dba) or laeq_dba < 0.0:
+        return float("nan")
+
+    try:
+        return float(
+            NIOSH_REFERENCE_DURATION_HOURS
+            * 2.0 ** (
+                (NIOSH_REFERENCE_LEVEL_DBA - laeq_dba)
+                / NIOSH_EXCHANGE_RATE_DB
+            )
+        )
+    except OverflowError:
+        return float("inf")
+
+
+def compute_niosh_dose_percent(
+    acquisition_duration_s: float,
+    max_exposure_hours: float,
+) -> float:
+    """Compute the indicative NIOSH dose accumulated during the recorded duration."""
+    if not np.isfinite(acquisition_duration_s) or acquisition_duration_s <= 0.0:
+        return 0.0
+    if not np.isfinite(max_exposure_hours):
+        return 0.0 if np.isposinf(max_exposure_hours) else float("nan")
+    if max_exposure_hours <= 0.0:
+        return float("inf")
+
+    acquisition_duration_hours = acquisition_duration_s / 3600.0
+    return float(acquisition_duration_hours / max_exposure_hours * 100.0)
+
+
+def format_exposure_duration(duration_hours: float) -> str:
+    """Format an exposure duration with compact human-readable units."""
+    if not np.isfinite(duration_hours) or duration_hours <= 0.0:
+        return "unavailable"
+    if duration_hours > 24.0:
+        return "more than 24 h"
+
+    duration_minutes = duration_hours * 60.0
+    if duration_minutes < 1.0:
+        return "less than 1 min"
+    if duration_hours < 1.0:
+        rounded_minutes = max(1, int(round(duration_minutes)))
+        return f"{rounded_minutes} min"
+
+    rounded_hours = round(duration_hours)
+    if abs(duration_hours - rounded_hours) < 0.05:
+        return f"{int(rounded_hours)} h"
+    if duration_hours < 10.0:
+        return f"{duration_hours:.1f} h"
+    return f"{duration_hours:.0f} h"
+
+
+def build_niosh_warning(
+    laeq_dba: float,
+    max_exposure_hours: float,
+    acquisition_duration_s: float,
+) -> tuple[str, str]:
+    """Build a compact NIOSH-style warning for the estimated LAeq."""
+    if not np.isfinite(laeq_dba) or laeq_dba < 0.0:
+        return "unavailable", "Sound exposure warning unavailable."
+
+    formatted_time = format_exposure_duration(max_exposure_hours)
+    if laeq_dba < 70.0:
+        return "low", "Low sound exposure level under ordinary conditions."
+    if laeq_dba < 82.0:
+        return (
+            "notice",
+            (
+                "Sustained exposure should be monitored, although this level is "
+                "below the main NIOSH 85 dBA reference."
+            ),
+        )
+    if laeq_dba < 85.0:
+        return (
+            "caution",
+            (
+                "If this level remains constant, avoid exposure longer than "
+                f"approximately {formatted_time}."
+            ),
+        )
+    if laeq_dba < 94.0:
+        return (
+            "warning",
+            (
+                "Potential hearing risk with prolonged exposure. If this level "
+                "remains constant, limit exposure to approximately "
+                f"{formatted_time}."
+            ),
+        )
+    if laeq_dba <= 100.0:
+        return (
+            "high",
+            (
+                "High sound exposure. If this level remains constant, limit "
+                f"exposure to approximately {formatted_time}."
+            ),
+        )
+    return (
+        "critical",
+        (
+            "Very high sound exposure. Reduce exposure and move away from the "
+            "source when possible. Indicative maximum duration: "
+            f"{formatted_time}."
+        ),
+    )
+
+
+def assess_sound_environment(
+    estimated_laeq_dba: float,
+    acquisition_duration_s: float,
+) -> SoundEnvironmentAssessment:
+    """Assess acoustic environment class, NIOSH exposure time and recorded dose."""
+    level_valid = np.isfinite(estimated_laeq_dba) and estimated_laeq_dba >= 0.0
+    duration_valid = (
+        np.isfinite(acquisition_duration_s)
+        and acquisition_duration_s >= MIN_SOUND_CLASSIFICATION_DURATION_S
+    )
+    estimate_valid = bool(level_valid and duration_valid)
+    short_acquisition = bool(acquisition_duration_s < SHORT_ACQUISITION_THRESHOLD_S)
+
+    if level_valid:
+        category_code, category_label, category_description = classify_sound_environment(
+            estimated_laeq_dba
+        )
+        max_exposure_hours = compute_niosh_max_exposure_hours(estimated_laeq_dba)
+    else:
+        category_code, category_label, category_description = (
+            INVALID_SOUND_ENVIRONMENT_CATEGORY
+        )
+        max_exposure_hours = float("nan")
+
+    recorded_dose_percent = compute_niosh_dose_percent(
+        acquisition_duration_s,
+        max_exposure_hours,
+    )
+    warning_level, warning_message = build_niosh_warning(
+        estimated_laeq_dba,
+        max_exposure_hours,
+        acquisition_duration_s,
+    )
+
+    if level_valid and not duration_valid:
+        warning_level = "unavailable"
+        warning_message = (
+            "Acquisition shorter than 0.5 s: sound level estimate is not "
+            "sufficiently stable."
+        )
+    elif estimate_valid and short_acquisition:
+        warning_message = (
+            warning_message
+            + " Short acquisition: result represents a brief acoustic snapshot."
+        )
+
+    return SoundEnvironmentAssessment(
+        estimated_laeq_dba=estimated_laeq_dba,
+        acquisition_duration_s=acquisition_duration_s,
+        category_code=category_code,
+        category_label=category_label,
+        category_description=category_description,
+        niosh_max_exposure_hours=max_exposure_hours,
+        niosh_max_exposure_minutes=max_exposure_hours * 60.0,
+        niosh_recorded_dose_percent=recorded_dose_percent,
+        niosh_reference_level_dba=NIOSH_REFERENCE_LEVEL_DBA,
+        niosh_exchange_rate_db=NIOSH_EXCHANGE_RATE_DB,
+        warning_level=warning_level,
+        warning_message=warning_message,
+        short_acquisition=short_acquisition,
+        estimate_valid=estimate_valid,
+    )
+
+
 def write_estimated_sound_level_csv(
     filename: Path,
     time_center_s: np.ndarray,
@@ -680,6 +961,9 @@ def write_estimated_sound_level_csv(
         "a_weighted_rms_dbfs",
         "estimated_lzeq_dbz",
         "estimated_laeq_dba",
+        "environment_category",
+        "environment_warning_level",
+        "niosh_max_exposure_minutes",
         "calibration_offset_db",
         "calibration_approximate",
     ]
@@ -687,6 +971,15 @@ def write_estimated_sound_level_csv(
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         for row_index in range(len(time_center_s)):
+            row_laeq_dba = float(estimated_laeq_dba[row_index])
+            environment_category, _, _ = classify_sound_environment(row_laeq_dba)
+            max_exposure_hours = compute_niosh_max_exposure_hours(row_laeq_dba)
+            warning_level, _ = build_niosh_warning(
+                row_laeq_dba,
+                max_exposure_hours,
+                AUDIO_SOUND_LEVEL_WINDOW_S,
+            )
+            max_exposure_minutes = max_exposure_hours * 60.0
             writer.writerow(
                 {
                     "time_center_s": f"{time_center_s[row_index]:.6f}",
@@ -694,6 +987,9 @@ def write_estimated_sound_level_csv(
                     "a_weighted_rms_dbfs": _format_number(a_weighted_level_dbfs[row_index], 6),
                     "estimated_lzeq_dbz": _format_number(estimated_lzeq_dbz[row_index], 6),
                     "estimated_laeq_dba": _format_number(estimated_laeq_dba[row_index], 6),
+                    "environment_category": environment_category,
+                    "environment_warning_level": warning_level,
+                    "niosh_max_exposure_minutes": _format_number(max_exposure_minutes, 6),
                     "calibration_offset_db": f"{SPL_CALIBRATION_OFFSET_DB:.2f}",
                     "calibration_approximate": str(SPL_CALIBRATION_APPROXIMATE),
                 }
@@ -775,6 +1071,85 @@ def _sound_level_report_lines(sound_metrics: EstimatedSoundLevelMetrics) -> list
     ]
 
 
+def _sound_environment_assessment_report_lines(
+    sound_assessment: SoundEnvironmentAssessment,
+) -> list[str]:
+    return [
+        "",
+        "Sound environment assessment",
+        (
+            "Estimated global LAeq [dBA]: "
+            f"{_format_db(sound_assessment.estimated_laeq_dba, 'dBA')}"
+        ),
+        f"Environment category: {sound_assessment.category_label}",
+        f"Environment description: {sound_assessment.category_description}",
+        f"Acquisition duration [s]: {sound_assessment.acquisition_duration_s:.6f}",
+        f"Short acquisition: {sound_assessment.short_acquisition}",
+        (
+            "NIOSH reference level [dBA]: "
+            f"{sound_assessment.niosh_reference_level_dba:.1f}"
+        ),
+        f"NIOSH exchange rate [dB]: {sound_assessment.niosh_exchange_rate_db:.1f}",
+        (
+            "Indicative maximum exposure time: "
+            f"{format_exposure_duration(sound_assessment.niosh_max_exposure_hours)}"
+        ),
+        (
+            "Recorded NIOSH dose [%]: "
+            f"{_format_number(sound_assessment.niosh_recorded_dose_percent, 6)}"
+        ),
+        f"Warning level: {sound_assessment.warning_level}",
+        f"Warning message: {sound_assessment.warning_message}",
+        "",
+        (
+            "The NIOSH exposure time is an indicative projection assuming\n"
+            "the measured LAeq remains constant. The sound level itself is\n"
+            "an approximate smartphone-calibrated estimate and is not a\n"
+            "certified sound-level-meter measurement."
+        ),
+    ]
+
+
+def write_sound_environment_assessment_report(
+    filename: Path,
+    sound_assessment: SoundEnvironmentAssessment,
+) -> None:
+    """Write a standalone acoustic environment assessment report."""
+    lines = [
+        (
+            "Estimated LAeq: "
+            f"{_format_db(sound_assessment.estimated_laeq_dba, 'dBA')}"
+        ),
+        f"Environment: {sound_assessment.category_label}",
+        f"Description: {sound_assessment.category_description}",
+        "",
+        (
+            "Indicative NIOSH maximum exposure time: "
+            f"{format_exposure_duration(sound_assessment.niosh_max_exposure_hours)}"
+        ),
+        f"Recorded duration: {sound_assessment.acquisition_duration_s:.3f} s",
+        (
+            "Recorded dose: "
+            f"{_format_number(sound_assessment.niosh_recorded_dose_percent, 3)} %"
+        ),
+        "",
+        f"Warning level: {sound_assessment.warning_level}",
+        "Warning:",
+        sound_assessment.warning_message,
+        "",
+        "Calibration status: approximate",
+        "",
+        (
+            "The NIOSH exposure time is an indicative projection assuming "
+            "the measured LAeq remains constant. The sound level itself is "
+            "an approximate smartphone-calibrated estimate and is not a "
+            "certified sound-level-meter measurement."
+        ),
+    ]
+    filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Audio environment assessment saved to: {filename}")
+
+
 def print_estimated_sound_level_metrics(sound_metrics: EstimatedSoundLevelMetrics) -> None:
     """Print approximate acoustic estimates to the terminal."""
     print("Estimated acoustic sound levels:")
@@ -785,6 +1160,30 @@ def print_estimated_sound_level_metrics(sound_metrics: EstimatedSoundLevelMetric
     print(f"  Calibration offset [dB]: {sound_metrics.calibration_offset_db:.2f}")
     status = "approximate" if sound_metrics.calibration_approximate else "certified"
     print(f"  Calibration status: {status}")
+
+
+def print_sound_environment_assessment(
+    sound_assessment: SoundEnvironmentAssessment,
+) -> None:
+    """Print the acoustic environment assessment to the terminal."""
+    print("Sound environment assessment:")
+    print(
+        "  Estimated global LAeq [dBA]: "
+        f"{_format_db(sound_assessment.estimated_laeq_dba, 'dBA')}"
+    )
+    print(f"  Environment category: {sound_assessment.category_label}")
+    print(f"  Environment description: {sound_assessment.category_description}")
+    print(
+        "  Indicative NIOSH maximum exposure time: "
+        f"{format_exposure_duration(sound_assessment.niosh_max_exposure_hours)}"
+    )
+    print(
+        "  Recorded dose [%]: "
+        f"{_format_number(sound_assessment.niosh_recorded_dose_percent, 3)}"
+    )
+    print(f"  Warning level: {sound_assessment.warning_level}")
+    print(f"  Warning message: {sound_assessment.warning_message}")
+    print(f"  Short acquisition: {sound_assessment.short_acquisition}")
 
 
 def write_amplified_wav_int16_mono(
@@ -1218,6 +1617,10 @@ def analyze_and_export_audio(
 
     metrics = compute_audio_metrics(audio, sample_rate_hz)
     sound_metrics = compute_estimated_sound_level_metrics(audio, sample_rate_hz)
+    sound_assessment = assess_sound_environment(
+        sound_metrics.estimated_laeq_dba,
+        metrics.duration_s,
+    )
     (
         sound_time_center_s,
         sound_unweighted_dbfs,
@@ -1275,10 +1678,28 @@ def analyze_and_export_audio(
     )
 
     metrics_filename = output_prefix.with_name(output_prefix.name + "_audio_metrics.txt")
-    write_audio_metrics_report(metrics_filename, metrics, sound_metrics)
-    append_audio_metrics_to_summary(summary_filename, metrics, sound_metrics)
+    write_audio_metrics_report(
+        metrics_filename,
+        metrics,
+        sound_metrics,
+        sound_assessment,
+    )
+    environment_assessment_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_environment_assessment.txt"
+    )
+    write_sound_environment_assessment_report(
+        environment_assessment_filename,
+        sound_assessment,
+    )
+    append_audio_metrics_to_summary(
+        summary_filename,
+        metrics,
+        sound_metrics,
+        sound_assessment,
+    )
     print_audio_metrics(metrics)
     print_estimated_sound_level_metrics(sound_metrics)
+    print_sound_environment_assessment(sound_assessment)
     return metrics
 
 

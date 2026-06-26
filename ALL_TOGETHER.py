@@ -91,58 +91,65 @@ LIGHT_LEVEL_LABELS = {
 
 
 # ---------------------------------------------------------------------------
-# Relative ambient-light classification from LRAW Clear counts
+# Personal light exposure classification from LRAW Clear counts
 # ---------------------------------------------------------------------------
-# This is an empirical, instrument-relative classification. It is NOT a lux
+# This is an empirical, wearer-relative classification. It is NOT a lux
 # measurement and must not be presented as one.
 #
 # Update LIGHT_SENSOR_GAIN and LIGHT_SENSOR_INTEGRATION_TIME_MS whenever the
-# firmware exposure settings change. The classifier rescales the measured
-# Clear counts to the reference exposure below, so the thresholds remain easy
-# to tune in one place.
-LIGHT_SENSOR_GAIN = 32.0
+# firmware exposure settings change. The classifier rescales measured Clear
+# counts to the reference exposure below; with the current 8x/27.8 ms settings
+# the reference-normalized Clear value is equal to the raw Clear value except
+# for the optional dark offset.
+LIGHT_SENSOR_GAIN = 8.0
 LIGHT_SENSOR_INTEGRATION_TIME_MS = 27.8
 
-LIGHT_CLASSIFICATION_REFERENCE_GAIN = 64.0
+LIGHT_CLASSIFICATION_REFERENCE_GAIN = 8.0
 LIGHT_CLASSIFICATION_REFERENCE_INTEGRATION_TIME_MS = 27.8
+
 LIGHT_DARK_OFFSET_COUNTS = 0.0
 LIGHT_ADC_FULL_SCALE_COUNTS = 10000.0
 LIGHT_CLASSIFICATION_SMOOTHING_SECONDS = 1.0
 
-# Thresholds are expressed as Clear counts normalized to the reference
-# exposure above. They are intentionally simple starting values derived from
-# the project's own dark/indoor/outdoor tests and should be refined with more
-# repeated measurements.
 LIGHT_CLASSIFICATION_THRESHOLDS_REFERENCE_COUNTS = (
-    10.0,
-    100.0,
-    1000.0,
-    3000.0,
-    8000.0,
+    2.0,       # DARK -> LOW_EXPOSURE
+    50.0,      # LOW_EXPOSURE -> MODERATE_EXPOSURE
+    6500.0,    # MODERATE_EXPOSURE -> HIGH_EXPOSURE
+    9800.0,    # HIGH_EXPOSURE -> VERY_HIGH_EXPOSURE
 )
 
 LIGHT_CLASSIFICATION_CATEGORIES = (
-    (0, "DARK", "Very little or no detected visible light"),
-    (1, "DIM", "Low relative ambient-light level"),
-    (2, "INDOOR_LIKE", "Moderate relative level, typically compatible with indoor light"),
+    (
+        0,
+        "DARK",
+        "The wearer is exposed to practically no detectable light",
+    ),
+    (
+        1,
+        "LOW_EXPOSURE",
+        "The wearer is exposed to a low light level",
+    ),
+    (
+        2,
+        "MODERATE_EXPOSURE",
+        "The wearer is exposed to an ordinary light level",
+    ),
     (
         3,
-        "BRIGHT_INDOOR_LIKE",
-        "High relative level, typically compatible with bright indoor light",
+        "HIGH_EXPOSURE",
+        "The wearer is exposed to a high light level",
     ),
     (
         4,
-        "OUTDOOR_LIKE",
-        "Very high relative level, typically compatible with outdoor light",
+        "VERY_HIGH_EXPOSURE",
+        "The wearer is exposed to a very high light level",
     ),
-    (5, "VERY_BRIGHT", "Extremely high relative ambient-light level"),
-)
-LIGHT_SATURATED_CATEGORY = (
-    6,
-    "SATURATED",
-    "Clear channel reached the configured ADC full scale; intensity is underestimated",
 )
 
+if len(LIGHT_CLASSIFICATION_THRESHOLDS_REFERENCE_COUNTS) != (
+    len(LIGHT_CLASSIFICATION_CATEGORIES) - 1
+):
+    raise RuntimeError("Light classification thresholds must be one fewer than categories")
 
 LIGHT_RAW_COLUMNS = [
     "sample_elapsed_ms",
@@ -2235,25 +2242,29 @@ def _relative_light_category(
     reference_clear_counts: float,
     saturated: bool,
 ) -> tuple[int, str, str]:
-    """Classify one sample using empirical Clear-count thresholds."""
+    """Classify personal light exposure using empirical Clear thresholds."""
+
+    # Saturation remains available separately through the is_saturated field,
+    # but for the wearer it represents very high light exposure.
     if saturated:
-        return LIGHT_SATURATED_CATEGORY
+        return LIGHT_CLASSIFICATION_CATEGORIES[-1]
 
     value = max(float(reference_clear_counts), 0.0)
+
     for threshold, category in zip(
         LIGHT_CLASSIFICATION_THRESHOLDS_REFERENCE_COUNTS,
         LIGHT_CLASSIFICATION_CATEGORIES,
     ):
         if value < threshold:
             return category
-    return LIGHT_CLASSIFICATION_CATEGORIES[-1]
 
+    return LIGHT_CLASSIFICATION_CATEGORIES[-1]
 
 def compute_relative_light_classification(
     light_raw_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, LightEnvironmentAssessment | None]:
     """
-    Build a per-sample relative ambient-light classification from Clear counts.
+    Build a per-sample personal light exposure classification from Clear counts.
 
     The original LRAW DataFrame is not modified. The returned score is bounded
     to 0..100 and is logarithmic for display only. Classes are empirical and
@@ -2373,10 +2384,7 @@ def compute_relative_light_classification(
     )
     category_lookup = {
         code: (label, description)
-        for code, label, description in (
-            *LIGHT_CLASSIFICATION_CATEGORIES,
-            LIGHT_SATURATED_CATEGORY,
-        )
+        for code, label, description in LIGHT_CLASSIFICATION_CATEGORIES
     }
     dominant_label, dominant_description = category_lookup[dominant_code]
 
@@ -2407,9 +2415,9 @@ def _light_assessment_report_lines(
     assessment: LightEnvironmentAssessment,
 ) -> list[str]:
     lines = [
-        "Relative ambient-light assessment",
+        "Personal light exposure assessment",
         "Method: AS7341 Clear channel with trailing median smoothing",
-        "Measurement type: empirical relative index; NOT lux",
+        "Measurement type: empirical personal exposure class; NOT lux",
         f"Configured sensor gain: {LIGHT_SENSOR_GAIN:g}x",
         (
             "Configured integration time [ms]: "
@@ -2436,10 +2444,10 @@ def _light_assessment_report_lines(
             f"{assessment.median_reference_clear_counts:.3f}"
         ),
         (
-            "Median Ambient Light Score [0..100]: "
+            "Median personal light score [0..100]: "
             f"{assessment.median_ambient_light_score:.3f}"
         ),
-        f"Dominant relative class: {assessment.dominant_class_label}",
+        f"Dominant exposure class: {assessment.dominant_class_label}",
         f"Dominant class description: {assessment.dominant_class_description}",
         (
             "Saturated Clear samples: "
@@ -2450,13 +2458,7 @@ def _light_assessment_report_lines(
         "Class occupancy",
     ]
 
-    ordered_labels = [
-        category[1]
-        for category in (
-            *LIGHT_CLASSIFICATION_CATEGORIES,
-            LIGHT_SATURATED_CATEGORY,
-        )
-    ]
+    ordered_labels = [category[1] for category in LIGHT_CLASSIFICATION_CATEGORIES]
     for label in ordered_labels:
         count = assessment.class_counts.get(label, 0)
         percentage = assessment.class_percentages.get(label, 0.0)
@@ -2499,10 +2501,10 @@ def append_light_environment_to_summary(
 def print_light_environment_assessment(
     assessment: LightEnvironmentAssessment,
 ) -> None:
-    print("Relative ambient-light assessment:")
+    print("Personal light exposure assessment:")
     print(f"  Dominant class: {assessment.dominant_class_label}")
     print(
-        "  Median Ambient Light Score: "
+        "  Median personal light score: "
         f"{assessment.median_ambient_light_score:.3f} / 100"
     )
     print(
@@ -2520,7 +2522,7 @@ def plot_relative_light_classification(
     classification_df: pd.DataFrame,
     filename: Path,
 ) -> Path | None:
-    """Plot Clear counts and the empirical relative-light class over time."""
+    """Plot Clear counts and the empirical personal exposure class over time."""
     if classification_df.empty:
         print("No light classification data available; skipping classification plot.")
         return None
@@ -2556,6 +2558,20 @@ def plot_relative_light_classification(
         linewidth=1.5,
         label="Smoothed Clear",
     )
+    saturated_mask = classification_df["is_saturated"].to_numpy(dtype=bool)
+    if np.any(saturated_mask):
+        ax_clear.scatter(
+            x[saturated_mask],
+            classification_df.loc[
+                saturated_mask,
+                "clear_counts",
+            ].to_numpy(dtype=np.float64),
+            marker="x",
+            s=28,
+            linewidths=1.0,
+            label="Raw saturation flag",
+            zorder=3,
+        )
 
     for threshold in LIGHT_CLASSIFICATION_THRESHOLDS_REFERENCE_COUNTS:
         ax_clear.axhline(
@@ -2570,9 +2586,10 @@ def plot_relative_light_classification(
         linewidth=1.2,
         label="Configured full scale",
     )
-    ax_clear.set_ylabel("Reference Clear counts")
+    ax_clear.set_ylim(0.0, LIGHT_ADC_FULL_SCALE_COUNTS * 1.05)
+    ax_clear.set_ylabel("Clear counts")
     ax_clear.set_title(
-        "AS7341 relative ambient-light classification (not lux)"
+        "AS7341 personal light exposure classification"
     )
     ax_clear.grid(True, alpha=0.4)
     ax_clear.legend()
@@ -2583,16 +2600,13 @@ def plot_relative_light_classification(
         where="post",
         linewidth=1.3,
     )
-    category_rows = (
-        *LIGHT_CLASSIFICATION_CATEGORIES,
-        LIGHT_SATURATED_CATEGORY,
-    )
+    category_rows = LIGHT_CLASSIFICATION_CATEGORIES
     category_codes = [category[0] for category in category_rows]
     category_labels = [category[1] for category in category_rows]
     ax_class.set_yticks(category_codes)
     ax_class.set_yticklabels(category_labels)
     ax_class.set_xlabel(x_label)
-    ax_class.set_ylabel("Relative class")
+    ax_class.set_ylabel("Exposure class")
     ax_class.grid(True, alpha=0.4)
 
     fig.savefig(filename, dpi=200, bbox_inches="tight")
@@ -3850,11 +3864,18 @@ def run_internal_tests() -> None:
     classification_test_df = _make_light_raw_test_df(
         [
             {"clear_counts": 0, "nir_counts": 0},
+            {"clear_counts": 3, "nir_counts": 0},
+            {"clear_counts": 4, "nir_counts": 0},
+            {"clear_counts": 20, "nir_counts": 0},
+            {"clear_counts": 49, "nir_counts": 0},
             {"clear_counts": 50, "nir_counts": 0},
             {"clear_counts": 500, "nir_counts": 0},
-            {"clear_counts": 2000, "nir_counts": 0},
-            {"clear_counts": 5000, "nir_counts": 0},
+            {"clear_counts": 6499, "nir_counts": 0},
+            {"clear_counts": 6500, "nir_counts": 0},
             {"clear_counts": 9000, "nir_counts": 0},
+            {"clear_counts": 9799, "nir_counts": 0},
+            {"clear_counts": 9800, "nir_counts": 0},
+            {"clear_counts": 9999, "nir_counts": 0},
             {"clear_counts": 10000, "nir_counts": 0},
         ]
     )
@@ -3871,13 +3892,44 @@ def run_internal_tests() -> None:
     assert assessment is not None
     assert classification_df["light_level_label"].tolist() == [
         "DARK",
-        "DIM",
-        "INDOOR_LIKE",
-        "BRIGHT_INDOOR_LIKE",
-        "OUTDOOR_LIKE",
-        "VERY_BRIGHT",
-        "SATURATED",
+        "DARK",
+        "LOW_EXPOSURE",
+        "LOW_EXPOSURE",
+        "LOW_EXPOSURE",
+        "MODERATE_EXPOSURE",
+        "MODERATE_EXPOSURE",
+        "MODERATE_EXPOSURE",
+        "HIGH_EXPOSURE",
+        "HIGH_EXPOSURE",
+        "HIGH_EXPOSURE",
+        "VERY_HIGH_EXPOSURE",
+        "VERY_HIGH_EXPOSURE",
+        "VERY_HIGH_EXPOSURE",
     ]
+    assert classification_df["is_saturated"].tolist() == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert classification_df.loc[
+        classification_df["clear_counts"] == 10000,
+        "light_level_label",
+    ].iloc[0] == "VERY_HIGH_EXPOSURE"
+    assert bool(classification_df.loc[
+        classification_df["clear_counts"] == 10000,
+        "is_saturated",
+    ].iloc[0])
     assert assessment.saturated_sample_count == 1
 
     print("Internal synthetic tests passed.")

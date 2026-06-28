@@ -61,6 +61,7 @@ END_MARKER = b"LOGEND!!"
 MAGIC_SENSOR = b"SENS"
 MAGIC_AUDIO = b"AUD0"
 MAGIC_AUDIO_FEATURE = b"AFEA"
+MAGIC_LIGHT_FEATURE = b"LFEA"
 MAGIC_LIGHT_RAW = b"LRAW"
 MAGIC_LIGHT = b"LITE"
 
@@ -83,6 +84,43 @@ AUDIO_FLAG_SILENT_OR_UNAVAILABLE = 1 << 5
 AUDIO_FLAG_IMPULSIVE_EVENT = 1 << 6
 AUDIO_FLAG_RESERVED = 1 << 7
 AUDIO_RECONSTRUCTIBLE_FLAG_MASK = 0x7F
+
+LIGHT_FEATURE_RECORD_VERSION = 1
+LIGHT_FEATURE_RECORD_FORMAT = "<II10HBB"
+LIGHT_FEATURE_RECORD_SIZE = 30
+LIGHT_FEATURE_RECORDS_PER_PAGE = (PAGE_SIZE - PAGE_HEADER_SIZE) // LIGHT_FEATURE_RECORD_SIZE
+
+LIGHT_FLAG_COMPLETE = 1 << 0
+LIGHT_FLAG_ACQUISITION_VALID = 1 << 1
+LIGHT_FLAG_CLASSIFICATION_VALID = 1 << 2
+LIGHT_FLAG_SATURATED = 1 << 3
+LIGHT_FLAG_I2C_ERROR = 1 << 4
+LIGHT_FLAG_SMUX_ERROR = 1 << 5
+LIGHT_FLAG_RESERVED_6 = 1 << 6
+LIGHT_FLAG_RESERVED_7 = 1 << 7
+LIGHT_RECONSTRUCTIBLE_FLAG_MASK = 0x0F
+
+LIGHT_EXPOSURE_UNAVAILABLE = 255
+LIGHT_EXPOSURE_LABELS = {
+    0: "DARK",
+    1: "LOW_EXPOSURE",
+    2: "MODERATE_EXPOSURE",
+    3: "HIGH_EXPOSURE",
+    4: "VERY_HIGH_EXPOSURE",
+    LIGHT_EXPOSURE_UNAVAILABLE: "UNAVAILABLE",
+}
+
+LIGHT_THRESHOLD_DARK_TO_LOW_COUNTS = 3
+LIGHT_THRESHOLD_LOW_TO_MODERATE_COUNTS = 50
+LIGHT_THRESHOLD_MODERATE_TO_HIGH_COUNTS = 6500
+LIGHT_THRESHOLD_HIGH_TO_VERY_HIGH_COUNTS = 9800
+LIGHT_SATURATION_CLEAR_COUNTS = 10000
+LIGHT_FEATURE_BOUNDARY_THRESHOLDS = (
+    LIGHT_THRESHOLD_DARK_TO_LOW_COUNTS,
+    LIGHT_THRESHOLD_LOW_TO_MODERATE_COUNTS,
+    LIGHT_THRESHOLD_MODERATE_TO_HIGH_COUNTS,
+    LIGHT_THRESHOLD_HIGH_TO_VERY_HIGH_COUNTS,
+)
 
 AUDIO_ENVIRONMENT_LABELS = {
     0: "VERY_QUIET",
@@ -130,6 +168,29 @@ AUDIO_FEATURE_COMPARISON_COLUMNS = [
     "overall_match",
 ]
 
+LIGHT_FEATURE_COLUMNS = [
+    "window_sequence", "sample_timestamp_ms", "boot_session",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "clear", "nir",
+    "exposure_class", "exposure_label", "flags", "flags_hex",
+    "flag_complete", "flag_acquisition_valid", "flag_classification_valid",
+    "flag_saturated", "flag_i2c_error", "flag_smux_error",
+    "flag_reserved_6", "flag_reserved_7",
+    "expected_saturated", "saturation_match",
+    "python_previous_exposure_class", "python_exposure_class",
+    "classification_match", "python_flags_reconstructible",
+    "flags_reconstructible_match", "reserved_flags_valid", "record_valid",
+    "overall_match", "physical_page_index", "page_sequence",
+    "page_timestamp_ms", "record_index_in_page", "record_payload_offset",
+    "page_version", "page_header_size", "page_payload_bytes",
+]
+
+COMPACT_FEATURE_ALIGNMENT_COLUMNS = [
+    "window_sequence", "audio_feature_present", "light_feature_present",
+    "audio_window_start_ms", "light_sample_timestamp_ms",
+    "light_minus_audio_timestamp_ms", "audio_environment_class",
+    "light_exposure_class", "audio_flags", "light_flags", "pair_status",
+]
+
 LIGHT_RAW_RECORD_FORMAT = "<II10H"
 LIGHT_RAW_RECORD_SIZE = 28
 MAX_REASONABLE_LRAW_ELAPSED_MS = 24 * 60 * 60 * 1000
@@ -145,6 +206,8 @@ if struct.calcsize(LIGHT_RAW_RECORD_FORMAT) != LIGHT_RAW_RECORD_SIZE:
 
 if struct.calcsize(AUDIO_FEATURE_RECORD_FORMAT) != AUDIO_FEATURE_RECORD_SIZE:
     raise RuntimeError("Unexpected AFEA record size")
+
+assert struct.calcsize(LIGHT_FEATURE_RECORD_FORMAT) == LIGHT_FEATURE_RECORD_SIZE
 
 if struct.calcsize(PAGE_HEADER_FORMAT) != PAGE_HEADER_SIZE:
     raise RuntimeError("Unexpected NAND page header size")
@@ -448,6 +511,93 @@ def parse_audio_feature_record(record: bytes) -> dict:
         "flag_impulsive_event": bool(flags & AUDIO_FLAG_IMPULSIVE_EVENT),
         "flag_reserved": bool(flags & AUDIO_FLAG_RESERVED),
     }
+
+
+def parse_light_feature_record(record: bytes) -> dict:
+    if len(record) != LIGHT_FEATURE_RECORD_SIZE:
+        raise ValueError(
+            f"LFEA record must be {LIGHT_FEATURE_RECORD_SIZE} bytes; got {len(record)}"
+        )
+
+    (
+        window_sequence,
+        sample_timestamp_ms,
+        f1,
+        f2,
+        f3,
+        f4,
+        f5,
+        f6,
+        f7,
+        f8,
+        clear,
+        nir,
+        exposure_class,
+        flags,
+    ) = struct.unpack(LIGHT_FEATURE_RECORD_FORMAT, record)
+
+    return {
+        "window_sequence": window_sequence,
+        "sample_timestamp_ms": sample_timestamp_ms,
+        "f1": f1,
+        "f2": f2,
+        "f3": f3,
+        "f4": f4,
+        "f5": f5,
+        "f6": f6,
+        "f7": f7,
+        "f8": f8,
+        "clear": clear,
+        "nir": nir,
+        "exposure_class": exposure_class,
+        "exposure_label": LIGHT_EXPOSURE_LABELS.get(exposure_class, "UNKNOWN"),
+        "flags": flags,
+        "flags_hex": f"0x{flags:02X}",
+        "flag_complete": bool(flags & LIGHT_FLAG_COMPLETE),
+        "flag_acquisition_valid": bool(flags & LIGHT_FLAG_ACQUISITION_VALID),
+        "flag_classification_valid": bool(flags & LIGHT_FLAG_CLASSIFICATION_VALID),
+        "flag_saturated": bool(flags & LIGHT_FLAG_SATURATED),
+        "flag_i2c_error": bool(flags & LIGHT_FLAG_I2C_ERROR),
+        "flag_smux_error": bool(flags & LIGHT_FLAG_SMUX_ERROR),
+        "flag_reserved_6": bool(flags & LIGHT_FLAG_RESERVED_6),
+        "flag_reserved_7": bool(flags & LIGHT_FLAG_RESERVED_7),
+    }
+
+
+def classify_light_with_hysteresis(
+    clear_counts: int,
+    previous_class: int | None,
+) -> int:
+    if previous_class is None:
+        classification = 0
+        while (
+            classification < 4
+            and clear_counts >= LIGHT_FEATURE_BOUNDARY_THRESHOLDS[classification]
+        ):
+            classification += 1
+    else:
+        if previous_class not in range(5):
+            raise ValueError(f"Invalid previous light exposure class: {previous_class}")
+        classification = previous_class
+
+        while (
+            classification < 4
+            and clear_counts >= LIGHT_FEATURE_BOUNDARY_THRESHOLDS[classification]
+        ):
+            classification += 1
+
+        while classification > 0:
+            threshold = LIGHT_FEATURE_BOUNDARY_THRESHOLDS[classification - 1]
+            return_margin = max(1, (threshold * 5 + 99) // 100)
+            return_threshold = threshold - return_margin
+            if clear_counts >= return_threshold:
+                break
+            classification -= 1
+
+    if clear_counts >= LIGHT_SATURATION_CLEAR_COUNTS:
+        classification = 4
+
+    return classification
 
 
 def round_half_away_from_zero(value: float) -> int:
@@ -2090,6 +2240,7 @@ class ParseStats:
     sensor_pages: int = 0
     audio_pages: int = 0
     audio_feature_pages: int = 0
+    light_feature_pages: int = 0
     light_raw_pages: int = 0
     light_pages: int = 0
     unknown_pages: int = 0
@@ -2102,6 +2253,12 @@ class ParseStats:
     invalid_audio_feature_pages: int = 0
     invalid_audio_feature_records: int = 0
     audio_feature_payload_remainder_bytes: int = 0
+    light_feature_records: int = 0
+    light_feature_payload_bytes: int = 0
+    invalid_light_feature_pages: int = 0
+    invalid_light_feature_records: int = 0
+    light_feature_payload_remainder_bytes: int = 0
+    light_feature_validation_result: str = "NOT AVAILABLE"
     audio_complete_windows: int = 0
     audio_partial_windows: int = 0
     audio_feature_paired_windows: int = 0
@@ -3554,6 +3711,431 @@ def write_audio_feature_comparison_report(
     report_filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def assign_light_boot_sessions(
+    light_feature_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, int, int]:
+    """Assign boot sessions from HAL tick resets without changing row order."""
+    result = light_feature_df.copy()
+
+    if result.empty:
+        result["boot_session"] = pd.Series(dtype="int64")
+        return result, 0, 0
+
+    boot_sessions = []
+    current_session = 0
+    timestamp_resets = 0
+    unexpected_regressions = 0
+    previous_timestamp = None
+    previous_sequence = None
+
+    for row in result.itertuples(index=False):
+        timestamp = int(row.sample_timestamp_ms)
+        sequence = int(row.window_sequence)
+
+        if previous_timestamp is not None and timestamp < previous_timestamp:
+            if previous_sequence is not None and sequence > previous_sequence:
+                current_session += 1
+                timestamp_resets += 1
+            else:
+                unexpected_regressions += 1
+
+        boot_sessions.append(current_session)
+        previous_timestamp = timestamp
+        previous_sequence = sequence
+
+    result["boot_session"] = pd.Series(
+        boot_sessions,
+        index=result.index,
+        dtype="int64",
+    )
+    return result, timestamp_resets, unexpected_regressions
+
+
+def validate_light_feature_records(
+    light_feature_rows: list[dict],
+    stats: ParseStats,
+) -> tuple[pd.DataFrame, dict]:
+    rows = []
+    warnings = []
+    previous_python_class = None
+
+    sequences = [int(row["window_sequence"]) for row in light_feature_rows]
+    timestamps = [int(row["sample_timestamp_ms"]) for row in light_feature_rows]
+    sequence_monotonic = all(
+        right > left for left, right in zip(sequences, sequences[1:])
+    )
+    sequence_gaps = [
+        (left, right)
+        for left, right in zip(sequences, sequences[1:])
+        if right > left + 1
+    ]
+    duplicate_sequences = sorted(
+        sequence for sequence in set(sequences) if sequences.count(sequence) > 1
+    )
+    for source in light_feature_rows:
+        row = dict(source)
+        exposure_class = int(row["exposure_class"])
+        flags = int(row["flags"])
+        complete = bool(row["flag_complete"])
+        acquisition_valid = bool(row["flag_acquisition_valid"])
+        classification_valid = bool(row["flag_classification_valid"])
+        class_in_range = exposure_class in range(5)
+        class_flag_consistent = (
+            class_in_range if classification_valid
+            else exposure_class == LIGHT_EXPOSURE_UNAVAILABLE
+        )
+        record_valid = (
+            complete
+            and acquisition_valid
+            and classification_valid
+            and class_in_range
+        )
+        expected_saturated = int(row["clear"]) >= LIGHT_SATURATION_CLEAR_COUNTS
+        python_previous_class = previous_python_class
+
+        if record_valid:
+            python_class = classify_light_with_hysteresis(
+                int(row["clear"]), previous_python_class
+            )
+            classification_match = exposure_class == python_class
+            saturation_match = (
+                bool(row["flag_saturated"]) == expected_saturated
+                and (not bool(row["flag_saturated"]) or exposure_class == 4)
+            )
+            python_flags = (
+                LIGHT_FLAG_COMPLETE
+                | LIGHT_FLAG_ACQUISITION_VALID
+                | LIGHT_FLAG_CLASSIFICATION_VALID
+                | (LIGHT_FLAG_SATURATED if expected_saturated else 0)
+            )
+            previous_python_class = python_class
+        else:
+            python_class = LIGHT_EXPOSURE_UNAVAILABLE
+            classification_match = class_flag_consistent
+            saturation_match = not bool(row["flag_saturated"])
+            python_flags = 0
+
+        flags_reconstructible_match = (
+            flags & LIGHT_RECONSTRUCTIBLE_FLAG_MASK
+        ) == (python_flags & LIGHT_RECONSTRUCTIBLE_FLAG_MASK)
+        reserved_flags_valid = not bool(
+            flags & (LIGHT_FLAG_RESERVED_6 | LIGHT_FLAG_RESERVED_7)
+        )
+        error_flags_valid = not (
+            record_valid
+            and (bool(row["flag_i2c_error"]) or bool(row["flag_smux_error"]))
+        )
+        overall_match = all(
+            (
+                record_valid,
+                class_flag_consistent,
+                classification_match,
+                saturation_match,
+                flags_reconstructible_match,
+                reserved_flags_valid,
+                error_flags_valid,
+            )
+        )
+
+        row.update(
+            {
+                "expected_saturated": expected_saturated,
+                "saturation_match": saturation_match,
+                "python_previous_exposure_class": python_previous_class,
+                "python_exposure_class": python_class,
+                "classification_match": classification_match,
+                "python_flags_reconstructible": python_flags,
+                "flags_reconstructible_match": flags_reconstructible_match,
+                "reserved_flags_valid": reserved_flags_valid,
+                "record_valid": record_valid,
+                "overall_match": overall_match,
+            }
+        )
+        rows.append(row)
+
+        sequence = int(row["window_sequence"])
+        if not class_flag_consistent:
+            warnings.append(
+                f"Sequence {sequence}: classification flag/class combination is inconsistent"
+            )
+        if not reserved_flags_valid:
+            warnings.append(f"Sequence {sequence}: reserved flag bits are non-zero")
+        if not error_flags_valid:
+            warnings.append(
+                f"Sequence {sequence}: valid record carries I2C_ERROR or SMUX_ERROR"
+            )
+        if record_valid and not classification_match:
+            warnings.append(f"Sequence {sequence}: exposure classification mismatch")
+        if record_valid and not saturation_match:
+            warnings.append(f"Sequence {sequence}: saturation mismatch")
+        if not flags_reconstructible_match:
+            warnings.append(f"Sequence {sequence}: reconstructible flag mismatch")
+
+    light_feature_df = pd.DataFrame(rows, columns=LIGHT_FEATURE_COLUMNS)
+    (
+        light_feature_df,
+        recognized_timestamp_resets,
+        unexpected_timestamp_regressions,
+    ) = assign_light_boot_sessions(light_feature_df)
+    global_timestamp_regressions = int(
+        (
+            light_feature_df["sample_timestamp_ms"].diff().dropna() < 0
+        ).sum()
+    ) if not light_feature_df.empty else 0
+    detected_boot_sessions = (
+        int(light_feature_df["boot_session"].nunique())
+        if not light_feature_df.empty else 0
+    )
+    non_monotonic_timestamps_within_sessions = 0
+    for _, session_df in light_feature_df.groupby("boot_session", sort=True):
+        non_monotonic_timestamps_within_sessions += int(
+            (session_df["sample_timestamp_ms"].diff().dropna() < 0).sum()
+        )
+
+    if unexpected_timestamp_regressions:
+        warnings.append(
+            "Unexpected LFEA timestamp regressions: "
+            f"{unexpected_timestamp_regressions}"
+        )
+    if non_monotonic_timestamps_within_sessions:
+        warnings.append(
+            "Non-monotonic LFEA timestamps within boot sessions: "
+            f"{non_monotonic_timestamps_within_sessions}"
+        )
+
+    valid_mask = (
+        light_feature_df["record_valid"].astype(bool)
+        if not light_feature_df.empty else pd.Series(dtype=bool)
+    )
+    semantic_invalid_records = int((~valid_mask).sum()) if not valid_mask.empty else 0
+    stats.invalid_light_feature_records += semantic_invalid_records
+
+    valid_records = int(valid_mask.sum()) if not valid_mask.empty else 0
+    classification_matches = int(
+        (valid_mask & light_feature_df["classification_match"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+    classification_mismatches = int(
+        (valid_mask & ~light_feature_df["classification_match"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+    saturation_matches = int(
+        (valid_mask & light_feature_df["saturation_match"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+    saturation_mismatches = int(
+        (valid_mask & ~light_feature_df["saturation_match"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+    flag_mismatches = int(
+        (~light_feature_df["flags_reconstructible_match"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+    reserved_violations = int(
+        (~light_feature_df["reserved_flags_valid"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+
+    structural_failures = (
+        stats.invalid_light_feature_pages
+        + stats.invalid_light_feature_records
+        + stats.light_feature_payload_remainder_bytes
+        + int(bool(sequences) and not sequence_monotonic)
+        + len(sequence_gaps)
+        + len(duplicate_sequences)
+        + unexpected_timestamp_regressions
+        + non_monotonic_timestamps_within_sessions
+    )
+    row_failures = int(
+        (~light_feature_df["overall_match"].astype(bool)).sum()
+    ) if not light_feature_df.empty else 0
+    if light_feature_df.empty:
+        final_result = "NOT AVAILABLE"
+    elif structural_failures or row_failures:
+        final_result = "FAIL"
+    else:
+        final_result = "PASS"
+
+    summary = {
+        "first_window_sequence": sequences[0] if sequences else None,
+        "last_window_sequence": sequences[-1] if sequences else None,
+        "sequence_monotonic": sequence_monotonic,
+        "sequence_gaps": sequence_gaps,
+        "duplicate_sequences": duplicate_sequences,
+        "first_timestamp_ms": timestamps[0] if timestamps else None,
+        "last_timestamp_ms": timestamps[-1] if timestamps else None,
+        "detected_boot_sessions": detected_boot_sessions,
+        "global_timestamp_regressions": global_timestamp_regressions,
+        "recognized_timestamp_resets": recognized_timestamp_resets,
+        "non_monotonic_timestamps_within_sessions":
+            non_monotonic_timestamps_within_sessions,
+        "unexpected_timestamp_regressions": unexpected_timestamp_regressions,
+        "valid_records": valid_records,
+        "invalid_records": stats.invalid_light_feature_records,
+        "saturated_records": int(light_feature_df["flag_saturated"].sum())
+            if not light_feature_df.empty else 0,
+        "i2c_error_records": int(light_feature_df["flag_i2c_error"].sum())
+            if not light_feature_df.empty else 0,
+        "smux_error_records": int(light_feature_df["flag_smux_error"].sum())
+            if not light_feature_df.empty else 0,
+        "reserved_flag_violations": reserved_violations,
+        "classification_matches": classification_matches,
+        "classification_mismatches": classification_mismatches,
+        "saturation_matches": saturation_matches,
+        "saturation_mismatches": saturation_mismatches,
+        "flag_mismatches": flag_mismatches,
+        "final_result": final_result,
+        "warnings": warnings,
+    }
+    return light_feature_df, summary
+
+
+def align_compact_feature_records(
+    audio_feature_df: pd.DataFrame,
+    light_feature_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    audio_records = audio_feature_df.to_dict("records")
+    light_records = light_feature_df.to_dict("records")
+    audio_by_sequence = {}
+    light_by_sequence = {}
+    for record in audio_records:
+        audio_by_sequence.setdefault(int(record["window_sequence"]), []).append(record)
+    for record in light_records:
+        light_by_sequence.setdefault(int(record["window_sequence"]), []).append(record)
+
+    all_sequences = sorted(set(audio_by_sequence) | set(light_by_sequence))
+    rows = []
+    for sequence in all_sequences:
+        audio_group = audio_by_sequence.get(sequence, [])
+        light_group = light_by_sequence.get(sequence, [])
+        audio = audio_group[0] if audio_group else None
+        light = light_group[0] if light_group else None
+
+        if audio is not None and light is not None:
+            pair_status = "PAIRED"
+        elif audio is not None:
+            pair_status = "AFEA_ONLY"
+        else:
+            pair_status = "LFEA_ONLY"
+        if len(audio_group) > 1:
+            pair_status += ";DUPLICATE_AFEA"
+        if len(light_group) > 1:
+            pair_status += ";DUPLICATE_LFEA"
+
+        audio_start = int(audio["window_start_ms"]) if audio is not None else None
+        light_timestamp = (
+            int(light["sample_timestamp_ms"]) if light is not None else None
+        )
+        rows.append(
+            {
+                "window_sequence": sequence,
+                "audio_feature_present": audio is not None,
+                "light_feature_present": light is not None,
+                "audio_window_start_ms": audio_start,
+                "light_sample_timestamp_ms": light_timestamp,
+                "light_minus_audio_timestamp_ms": (
+                    light_timestamp - audio_start
+                    if audio_start is not None and light_timestamp is not None
+                    else None
+                ),
+                "audio_environment_class": (
+                    int(audio["environment_class"]) if audio is not None else None
+                ),
+                "light_exposure_class": (
+                    int(light["exposure_class"]) if light is not None else None
+                ),
+                "audio_flags": int(audio["flags"]) if audio is not None else None,
+                "light_flags": int(light["flags"]) if light is not None else None,
+                "pair_status": pair_status,
+            }
+        )
+
+    audio_sequences = set(audio_by_sequence)
+    light_sequences = set(light_by_sequence)
+    sequence_gaps = [
+        (left, right)
+        for left, right in zip(all_sequences, all_sequences[1:])
+        if right > left + 1
+    ]
+    summary = {
+        "paired_sequences": len(audio_sequences & light_sequences),
+        "afea_without_lfea": len(audio_sequences - light_sequences),
+        "lfea_without_afea": len(light_sequences - audio_sequences),
+        "duplicate_afea_sequences": sorted(
+            sequence for sequence, records in audio_by_sequence.items() if len(records) > 1
+        ),
+        "duplicate_lfea_sequences": sorted(
+            sequence for sequence, records in light_by_sequence.items() if len(records) > 1
+        ),
+        "sequence_gaps": sequence_gaps,
+    }
+    return pd.DataFrame(rows, columns=COMPACT_FEATURE_ALIGNMENT_COLUMNS), summary
+
+
+def write_light_feature_validation_report(
+    report_filename: Path,
+    stats: ParseStats,
+    light_feature_df: pd.DataFrame,
+    validation_summary: dict,
+    alignment_summary: dict,
+) -> None:
+    lines = [
+        "Light feature validation",
+        f"LFEA pages: {stats.light_feature_pages}",
+        f"LFEA records: {stats.light_feature_records}",
+        f"LFEA payload bytes: {stats.light_feature_payload_bytes}",
+        f"LFEA invalid pages: {stats.invalid_light_feature_pages}",
+        f"LFEA invalid records: {stats.invalid_light_feature_records}",
+        f"LFEA remainder bytes: {stats.light_feature_payload_remainder_bytes}",
+        f"First window sequence: {validation_summary['first_window_sequence']}",
+        f"Last window sequence: {validation_summary['last_window_sequence']}",
+        f"Sequence monotonic: {validation_summary['sequence_monotonic']}",
+        f"Sequence gaps: {validation_summary['sequence_gaps']}",
+        f"Duplicate sequences: {validation_summary['duplicate_sequences']}",
+        f"First timestamp: {validation_summary['first_timestamp_ms']}",
+        f"Last timestamp: {validation_summary['last_timestamp_ms']}",
+        f"Detected boot sessions: {validation_summary['detected_boot_sessions']}",
+        f"Global timestamp regressions: {validation_summary['global_timestamp_regressions']}",
+        f"Recognized timestamp resets: {validation_summary['recognized_timestamp_resets']}",
+        "Non-monotonic timestamps within sessions: "
+        f"{validation_summary['non_monotonic_timestamps_within_sessions']}",
+        "Unexpected timestamp regressions: "
+        f"{validation_summary['unexpected_timestamp_regressions']}",
+        f"Valid records: {validation_summary['valid_records']}",
+        f"Invalid records: {validation_summary['invalid_records']}",
+        f"Saturated records: {validation_summary['saturated_records']}",
+        f"I2C error records: {validation_summary['i2c_error_records']}",
+        f"SMUX error records: {validation_summary['smux_error_records']}",
+        f"Reserved flag violations: {validation_summary['reserved_flag_violations']}",
+        f"Classification matches: {validation_summary['classification_matches']}",
+        f"Classification mismatches: {validation_summary['classification_mismatches']}",
+        f"Saturation matches: {validation_summary['saturation_matches']}",
+        f"Saturation mismatches: {validation_summary['saturation_mismatches']}",
+        f"Flag mismatches: {validation_summary['flag_mismatches']}",
+        f"AFEA/LFEA paired sequences: {alignment_summary['paired_sequences']}",
+        f"AFEA without LFEA: {alignment_summary['afea_without_lfea']}",
+        f"LFEA without AFEA: {alignment_summary['lfea_without_afea']}",
+        f"Duplicate AFEA sequences: {alignment_summary['duplicate_afea_sequences']}",
+        f"Duplicate LFEA sequences: {alignment_summary['duplicate_lfea_sequences']}",
+        f"Compact sequence gaps: {alignment_summary['sequence_gaps']}",
+        "",
+    ]
+    lines.extend(f"Warning: {warning}" for warning in validation_summary["warnings"])
+    if validation_summary["warnings"]:
+        lines.append("")
+
+    for row in light_feature_df.to_dict("records"):
+        lines.extend(
+            [
+                f"Sequence {row['window_sequence']}:",
+                f"  Clear={row['clear']}",
+                f"  firmware_class={row['exposure_class']}",
+                f"  python_class={row['python_exposure_class']}",
+                f"  flags={row['flags_hex']}",
+                f"  classification_match={row['classification_match']}",
+                f"  saturation_match={row['saturation_match']}",
+                f"  {'PASS' if row['overall_match'] else 'FAIL'}",
+            ]
+        )
+
+    lines.extend(["", f"Overall result: {validation_summary['final_result']}"])
+    report_filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _output_prefix_from_summary(summary_filename: Path) -> Path:
     suffix = "_summary.txt"
     if summary_filename.name.endswith(suffix):
@@ -3577,6 +4159,7 @@ def parse_nand_dump(
     light_raw_rows = []
     light_rows = []
     audio_feature_rows = []
+    light_feature_rows = []
     audio_pages = []
     audio_bytes = bytearray()
     light_raw_debug_records = []
@@ -3616,10 +4199,13 @@ def parse_nand_dump(
             magic = struct.pack("<I", magic_word)
             is_light_raw_page = magic == MAGIC_LIGHT_RAW
             is_audio_feature_page = magic == MAGIC_AUDIO_FEATURE
+            is_light_feature_page = magic == MAGIC_LIGHT_FEATURE
             if is_light_raw_page:
                 stats.light_raw_pages += 1
             if is_audio_feature_page:
                 stats.audio_feature_pages += 1
+            if is_light_feature_page:
+                stats.light_feature_pages += 1
 
             if header_size != PAGE_HEADER_SIZE:
                 print(
@@ -3636,6 +4222,8 @@ def parse_nand_dump(
                     stats.invalid_light_raw_pages += 1
                 elif is_audio_feature_page:
                     stats.invalid_audio_feature_pages += 1
+                elif is_light_feature_page:
+                    stats.invalid_light_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3650,6 +4238,8 @@ def parse_nand_dump(
                     stats.invalid_light_raw_pages += 1
                 elif is_audio_feature_page:
                     stats.invalid_audio_feature_pages += 1
+                elif is_light_feature_page:
+                    stats.invalid_light_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3664,6 +4254,8 @@ def parse_nand_dump(
                     stats.invalid_light_raw_pages += 1
                 elif is_audio_feature_page:
                     stats.invalid_audio_feature_pages += 1
+                elif is_light_feature_page:
+                    stats.invalid_light_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3680,6 +4272,8 @@ def parse_nand_dump(
                     stats.invalid_light_raw_pages += 1
                 elif is_audio_feature_page:
                     stats.invalid_audio_feature_pages += 1
+                elif is_light_feature_page:
+                    stats.invalid_light_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3762,6 +4356,51 @@ def parse_nand_dump(
                     parsed["page_header_size"] = header_size
                     parsed["page_payload_bytes"] = payload_bytes
                     audio_feature_rows.append(parsed)
+
+            elif magic == MAGIC_LIGHT_FEATURE:
+                if version != LIGHT_FEATURE_RECORD_VERSION:
+                    print(
+                        f"Warning: LFEA page_sequence={page_sequence} has version={version}; "
+                        f"expected {LIGHT_FEATURE_RECORD_VERSION}; page skipped"
+                    )
+                    stats.invalid_light_feature_pages += 1
+                    physical_page_index += 1
+                    continue
+
+                stats.light_feature_payload_bytes += payload_bytes
+                n_records = payload_bytes // LIGHT_FEATURE_RECORD_SIZE
+                remainder = payload_bytes % LIGHT_FEATURE_RECORD_SIZE
+                if payload_bytes == 0:
+                    print(f"Warning: empty LFEA page at page_sequence={page_sequence}")
+                    stats.invalid_light_feature_pages += 1
+                if remainder:
+                    print(
+                        f"Warning: LFEA page_sequence={page_sequence} has "
+                        f"payload_bytes={payload_bytes}; ignoring {remainder} trailing byte(s)"
+                    )
+                    stats.invalid_light_feature_pages += 1
+                    stats.light_feature_payload_remainder_bytes += int(remainder)
+
+                for record_index_in_page in range(n_records):
+                    record_start = record_index_in_page * LIGHT_FEATURE_RECORD_SIZE
+                    record_end = record_start + LIGHT_FEATURE_RECORD_SIZE
+                    record = payload[record_start:record_end]
+                    try:
+                        parsed = parse_light_feature_record(record)
+                    except (ValueError, struct.error) as exc:
+                        print(f"Warning: invalid LFEA record skipped: {exc}")
+                        stats.invalid_light_feature_records += 1
+                        continue
+
+                    parsed["physical_page_index"] = physical_page_index
+                    parsed["page_sequence"] = page_sequence
+                    parsed["page_timestamp_ms"] = page_timestamp_ms
+                    parsed["record_index_in_page"] = record_index_in_page
+                    parsed["record_payload_offset"] = record_start
+                    parsed["page_version"] = version
+                    parsed["page_header_size"] = header_size
+                    parsed["page_payload_bytes"] = payload_bytes
+                    light_feature_rows.append(parsed)
 
             elif magic == MAGIC_LIGHT_RAW:
                 if payload_bytes == 0:
@@ -3871,6 +4510,7 @@ def parse_nand_dump(
     stats.light_records = len(light_rows)
     stats.audio_bytes = len(audio_bytes)
     stats.audio_feature_records = len(audio_feature_rows)
+    stats.light_feature_records = len(light_feature_rows)
 
     audio_window_rows, complete_audio_windows, audio_window_warnings = (
         reconstruct_audio_windows(audio_pages)
@@ -3882,6 +4522,18 @@ def parse_nand_dump(
 
     audio_feature_df = pd.DataFrame(audio_feature_rows, columns=AUDIO_FEATURE_COLUMNS)
     audio_window_df = pd.DataFrame(audio_window_rows, columns=AUDIO_WINDOW_COLUMNS)
+    light_feature_df, light_feature_validation = validate_light_feature_records(
+        light_feature_rows=light_feature_rows,
+        stats=stats,
+    )
+    compact_alignment_df, compact_alignment_summary = align_compact_feature_records(
+        audio_feature_df=audio_feature_df,
+        light_feature_df=light_feature_df,
+    )
+    stats.light_feature_validation_result = light_feature_validation["final_result"]
+    for warning in light_feature_validation["warnings"]:
+        print(f"Warning: {warning}")
+
     comparison_df, comparison_summary = compare_audio_feature_records(
         complete_windows=complete_audio_windows,
         audio_feature_rows=audio_feature_rows,
@@ -3918,6 +4570,15 @@ def parse_nand_dump(
     )
     audio_feature_comparison_report_filename = output_prefix.with_name(
         output_prefix.name + "_audio_feature_comparison.txt"
+    )
+    light_feature_csv_filename = output_prefix.with_name(
+        output_prefix.name + "_light_feature_records.csv"
+    )
+    light_feature_validation_report_filename = output_prefix.with_name(
+        output_prefix.name + "_light_feature_validation.txt"
+    )
+    compact_alignment_csv_filename = output_prefix.with_name(
+        output_prefix.name + "_compact_feature_alignment.csv"
     )
 
     imu_df = pd.DataFrame(sensor_rows)
@@ -3961,12 +4622,21 @@ def parse_nand_dump(
     light_df.to_csv(light_csv_filename, index=False)
     audio_feature_df.to_csv(audio_feature_csv_filename, index=False)
     comparison_df.to_csv(audio_feature_comparison_csv_filename, index=False)
+    light_feature_df.to_csv(light_feature_csv_filename, index=False)
+    compact_alignment_df.to_csv(compact_alignment_csv_filename, index=False)
     write_audio_feature_comparison_report(
         report_filename=audio_feature_comparison_report_filename,
         stats=stats,
         audio_window_rows=audio_window_rows,
         comparison_df=comparison_df,
         comparison_summary=comparison_summary,
+    )
+    write_light_feature_validation_report(
+        report_filename=light_feature_validation_report_filename,
+        stats=stats,
+        light_feature_df=light_feature_df,
+        validation_summary=light_feature_validation,
+        alignment_summary=compact_alignment_summary,
     )
 
     report_written = write_light_raw_diagnostics_report(
@@ -4021,6 +4691,32 @@ def parse_nand_dump(
         f"AFEA CSV filename: {audio_feature_csv_filename.name}\n"
         f"AFEA comparison CSV filename: {audio_feature_comparison_csv_filename.name}\n"
         f"AFEA comparison report filename: {audio_feature_comparison_report_filename.name}\n"
+        "\nLight feature records\n"
+        f"LFEA pages: {stats.light_feature_pages}\n"
+        f"LFEA records: {stats.light_feature_records}\n"
+        f"LFEA payload bytes: {stats.light_feature_payload_bytes}\n"
+        f"LFEA payload remainder: {stats.light_feature_payload_remainder_bytes}\n"
+        f"LFEA invalid pages: {stats.invalid_light_feature_pages}\n"
+        f"LFEA invalid records: {stats.invalid_light_feature_records}\n"
+        f"LFEA valid records: {light_feature_validation['valid_records']}\n"
+        f"LFEA saturated records: {light_feature_validation['saturated_records']}\n"
+        f"LFEA detected boot sessions: {light_feature_validation['detected_boot_sessions']}\n"
+        f"LFEA global timestamp regressions: {light_feature_validation['global_timestamp_regressions']}\n"
+        f"LFEA recognized timestamp resets: {light_feature_validation['recognized_timestamp_resets']}\n"
+        "LFEA non-monotonic timestamps within sessions: "
+        f"{light_feature_validation['non_monotonic_timestamps_within_sessions']}\n"
+        "LFEA unexpected timestamp regressions: "
+        f"{light_feature_validation['unexpected_timestamp_regressions']}\n"
+        f"LFEA classification matches: {light_feature_validation['classification_matches']}\n"
+        f"LFEA classification mismatches: {light_feature_validation['classification_mismatches']}\n"
+        f"LFEA flag mismatches: {light_feature_validation['flag_mismatches']}\n"
+        f"AFEA/LFEA paired sequences: {compact_alignment_summary['paired_sequences']}\n"
+        f"AFEA without LFEA: {compact_alignment_summary['afea_without_lfea']}\n"
+        f"LFEA without AFEA: {compact_alignment_summary['lfea_without_afea']}\n"
+        f"LFEA validation result: {stats.light_feature_validation_result}\n"
+        f"LFEA CSV filename: {light_feature_csv_filename.name}\n"
+        f"LFEA validation report filename: {light_feature_validation_report_filename.name}\n"
+        f"Compact alignment CSV filename: {compact_alignment_csv_filename.name}\n"
         f"IMU CSV file: {imu_csv_filename.name}\n"
         f"Light raw CSV file: {light_raw_csv_filename.name}\n"
         f"Legacy light CSV file: {light_csv_filename.name}\n"
@@ -4077,11 +4773,22 @@ def parse_nand_dump(
     print(f"Audio feature CSV saved to: {audio_feature_csv_filename}")
     print(f"Audio feature comparison CSV saved to: {audio_feature_comparison_csv_filename}")
     print(f"Audio feature comparison report saved to: {audio_feature_comparison_report_filename}")
+    print(f"Light feature CSV saved to: {light_feature_csv_filename}")
+    print(f"Light feature validation report saved to: {light_feature_validation_report_filename}")
+    print(f"Compact feature alignment CSV saved to: {compact_alignment_csv_filename}")
     if audio_metrics is not None:
         print(f"Audio WAV saved to: {wav_filename}")
     print(f"Summary saved to: {summary_filename}")
 
-    return imu_df, light_raw_df, light_df, bytes(audio_bytes), stats, light_raw_diagnostics
+    return (
+        imu_df,
+        light_raw_df,
+        light_df,
+        light_feature_df,
+        bytes(audio_bytes),
+        stats,
+        light_raw_diagnostics,
+    )
 
 
 def plot_imu_data(df: pd.DataFrame, output_prefix: Path) -> None:
@@ -4170,6 +4877,90 @@ def plot_light_results(light_df: pd.DataFrame, output_prefix: Path) -> None:
 
         print(f"Ambient light index: {row['clear_mean_counts']} counts")
         print(f"Light level: {row['light_level_label']}")
+
+
+def plot_light_feature_records(
+    light_feature_df: pd.DataFrame,
+    output_prefix: Path,
+) -> None:
+    if light_feature_df.empty:
+        print("No LFEA pages found; skipping compact light feature plots.")
+        return
+
+    print(f"LFEA records available: {len(light_feature_df)}.")
+    x = light_feature_df["window_sequence"].to_numpy(dtype=float)
+    channel_plots = [
+        ("F1 - 415 nm", "f1", "#7F3FBF", "-"),
+        ("F2 - 445 nm", "f2", "#123B73", "-"),
+        ("F3 - 480 nm", "f3", "#00AEEF", "-"),
+        ("F4 - 515 nm", "f4", "#00D5D8", "-"),
+        ("F5 - 555 nm", "f5", "#00A651", "-"),
+        ("F6 - 590 nm", "f6", "#F2D600", "-"),
+        ("F7 - 630 nm", "f7", "#FF9900", "-"),
+        ("F8 - 680 nm", "f8", "#FF1F1F", "-"),
+        ("Clear - broadband", "clear", "#666666", "--"),
+        ("NIR - 910 nm", "nir", "#C00000", "-"),
+    ]
+
+    fig_channels, ax_channels = plt.subplots(figsize=(12, 6))
+    for label, column, color, linestyle in channel_plots:
+        ax_channels.plot(
+            x,
+            light_feature_df[column].to_numpy(dtype=float),
+            label=label,
+            color=color,
+            linestyle=linestyle,
+            marker="o",
+            markersize=3,
+            linewidth=1.1,
+        )
+    ax_channels.set_xlabel("Window sequence")
+    ax_channels.set_ylabel("Raw counts")
+    ax_channels.set_title("AS7341 compact light feature channels")
+    ax_channels.grid(True, alpha=0.3)
+    ax_channels.legend(ncol=2, fontsize=8)
+    channels_filename = output_prefix.with_name(
+        output_prefix.name + "_light_feature_channels.png"
+    )
+    fig_channels.savefig(channels_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig_channels)
+    print(f"Light feature channel plot saved to: {channels_filename}")
+
+    valid_classes = light_feature_df["exposure_class"].isin(range(5))
+    fig_class, ax_class = plt.subplots(figsize=(12, 4))
+    ax_class.step(
+        x[valid_classes.to_numpy()],
+        light_feature_df.loc[valid_classes, "exposure_class"].to_numpy(dtype=float),
+        where="mid",
+        color="#2E6F95",
+        linewidth=1.5,
+        label="Exposure class",
+    )
+    saturated = valid_classes & light_feature_df["flag_saturated"].astype(bool)
+    if saturated.any():
+        ax_class.scatter(
+            light_feature_df.loc[saturated, "window_sequence"],
+            light_feature_df.loc[saturated, "exposure_class"],
+            color="#C00000",
+            marker="o",
+            s=45,
+            zorder=3,
+            label="Saturated",
+        )
+    ax_class.set_xlabel("Window sequence")
+    ax_class.set_ylabel("Exposure class")
+    ax_class.set_yticks(range(5))
+    ax_class.set_yticklabels(["DARK", "LOW", "MODERATE", "HIGH", "VERY_HIGH"])
+    ax_class.set_ylim(-0.25, 4.25)
+    ax_class.set_title("AS7341 embedded exposure classification")
+    ax_class.grid(True, alpha=0.3)
+    ax_class.legend()
+    class_filename = output_prefix.with_name(
+        output_prefix.name + "_light_feature_exposure_class.png"
+    )
+    fig_class.savefig(class_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig_class)
+    print(f"Light feature class plot saved to: {class_filename}")
 
 
 def plot_light_raw_channels(
@@ -4535,6 +5326,75 @@ def _run_parse_test_dump(dump_bytes: bytes):
 
 
 def run_internal_tests() -> None:
+    single_boot_df = pd.DataFrame(
+        {
+            "window_sequence": [1, 2, 3],
+            "sample_timestamp_ms": [10000, 20000, 30000],
+        },
+        index=[10, 20, 30],
+    )
+    assigned_df, timestamp_resets, unexpected_regressions = (
+        assign_light_boot_sessions(single_boot_df)
+    )
+    assert assigned_df["boot_session"].tolist() == [0, 0, 0]
+    assert assigned_df.index.tolist() == [10, 20, 30]
+    assert timestamp_resets == 0
+    assert unexpected_regressions == 0
+
+    reboot_df = pd.DataFrame(
+        {
+            "window_sequence": [1, 2, 3, 4, 5],
+            "sample_timestamp_ms": [10000, 20000, 30000, 5000, 15000],
+        }
+    )
+    assigned_df, timestamp_resets, unexpected_regressions = (
+        assign_light_boot_sessions(reboot_df)
+    )
+    assert assigned_df["boot_session"].tolist() == [0, 0, 0, 1, 1]
+    assert timestamp_resets == 1
+    assert unexpected_regressions == 0
+    within_session_regressions = sum(
+        int((session["sample_timestamp_ms"].diff().dropna() < 0).sum())
+        for _, session in assigned_df.groupby("boot_session", sort=True)
+    )
+    assert within_session_regressions == 0
+
+    two_reboots_df = pd.DataFrame(
+        {
+            "window_sequence": [1, 2, 3, 4, 5, 6],
+            "sample_timestamp_ms": [10000, 20000, 1000, 11000, 500, 10500],
+        }
+    )
+    assigned_df, timestamp_resets, unexpected_regressions = (
+        assign_light_boot_sessions(two_reboots_df)
+    )
+    assert assigned_df["boot_session"].tolist() == [0, 0, 1, 1, 2, 2]
+    assert timestamp_resets == 2
+    assert unexpected_regressions == 0
+
+    unexpected_df = pd.DataFrame(
+        {
+            "window_sequence": [1, 1],
+            "sample_timestamp_ms": [20000, 10000],
+        }
+    )
+    assigned_df, timestamp_resets, unexpected_regressions = (
+        assign_light_boot_sessions(unexpected_df)
+    )
+    assert assigned_df["boot_session"].tolist() == [0, 0]
+    assert timestamp_resets == 0
+    assert unexpected_regressions == 1
+
+    empty_df = pd.DataFrame(columns=["window_sequence", "sample_timestamp_ms"])
+    assigned_df, timestamp_resets, unexpected_regressions = (
+        assign_light_boot_sessions(empty_df)
+    )
+    assert assigned_df.empty
+    assert "boot_session" in assigned_df.columns
+    assert assigned_df["boot_session"].dtype == "int64"
+    assert timestamp_resets == 0
+    assert unexpected_regressions == 0
+
     audio_feature_record = struct.pack(
         AUDIO_FEATURE_RECORD_FORMAT,
         7,
@@ -4587,7 +5447,7 @@ def run_internal_tests() -> None:
         magic=MAGIC_AUDIO_FEATURE,
         payload=audio_feature_record + second_audio_feature_record,
     )
-    _, _, _, _, stats, _ = _run_parse_test_dump(afea_page)
+    _, _, _, _, _, stats, _ = _run_parse_test_dump(afea_page)
     assert stats.audio_feature_pages == 1
     assert stats.audio_feature_records == 2
     assert stats.audio_feature_payload_bytes == 48
@@ -4596,10 +5456,156 @@ def run_internal_tests() -> None:
         magic=MAGIC_AUDIO_FEATURE,
         payload=audio_feature_record + b"XYZ",
     )
-    _, _, _, _, stats, _ = _run_parse_test_dump(afea_remainder_page)
+    _, _, _, _, _, stats, _ = _run_parse_test_dump(afea_remainder_page)
     assert stats.audio_feature_records == 1
     assert stats.audio_feature_payload_bytes == 27
     assert stats.audio_feature_payload_remainder_bytes == 3
+
+    light_feature_record = struct.pack(
+        LIGHT_FEATURE_RECORD_FORMAT,
+        1,
+        2000,
+        10,
+        20,
+        30,
+        40,
+        50,
+        60,
+        70,
+        80,
+        100,
+        90,
+        2,
+        0x07,
+    )
+    assert struct.calcsize(LIGHT_FEATURE_RECORD_FORMAT) == 30
+    assert LIGHT_FEATURE_RECORDS_PER_PAGE == 136
+    assert len(light_feature_record) == LIGHT_FEATURE_RECORD_SIZE
+    assert struct.unpack_from("<I", light_feature_record, 0)[0] == 1
+    assert struct.unpack_from("<I", light_feature_record, 4)[0] == 2000
+    for channel_index, expected in enumerate((10, 20, 30, 40, 50, 60, 70, 80, 100, 90)):
+        assert struct.unpack_from("<H", light_feature_record, 8 + 2 * channel_index)[0] == expected
+    assert light_feature_record[28] == 2
+    assert light_feature_record[29] == 0x07
+
+    parsed_light_feature = parse_light_feature_record(light_feature_record)
+    assert parsed_light_feature["window_sequence"] == 1
+    assert parsed_light_feature["sample_timestamp_ms"] == 2000
+    assert parsed_light_feature["f1"] == 10
+    assert parsed_light_feature["f8"] == 80
+    assert parsed_light_feature["clear"] == 100
+    assert parsed_light_feature["nir"] == 90
+    assert parsed_light_feature["exposure_label"] == "MODERATE_EXPOSURE"
+    assert parsed_light_feature["flag_complete"]
+    assert parsed_light_feature["flag_acquisition_valid"]
+    assert parsed_light_feature["flag_classification_valid"]
+    assert not parsed_light_feature["flag_saturated"]
+
+    saturated_light_feature_record = struct.pack(
+        LIGHT_FEATURE_RECORD_FORMAT,
+        2,
+        12000,
+        11,
+        21,
+        31,
+        41,
+        51,
+        61,
+        71,
+        81,
+        10000,
+        91,
+        4,
+        0x0F,
+    )
+    parsed_saturated = parse_light_feature_record(saturated_light_feature_record)
+    assert parsed_saturated["flag_saturated"]
+    assert parsed_saturated["exposure_class"] == 4
+
+    lfea_page = _make_test_page(
+        magic=MAGIC_LIGHT_FEATURE,
+        payload=light_feature_record + saturated_light_feature_record,
+    )
+    _, _, _, light_feature_df, _, stats, _ = _run_parse_test_dump(lfea_page)
+    assert stats.light_feature_pages == 1
+    assert stats.light_feature_records == 2
+    assert stats.light_feature_payload_bytes == 60
+    assert stats.light_feature_payload_remainder_bytes == 0
+    assert stats.light_feature_validation_result == "PASS"
+    assert light_feature_df["classification_match"].tolist() == [True, True]
+    assert light_feature_df["saturation_match"].tolist() == [True, True]
+
+    lfea_remainder_page = _make_test_page(
+        magic=MAGIC_LIGHT_FEATURE,
+        payload=light_feature_record + b"12345",
+    )
+    _, _, _, light_feature_df, _, stats, _ = _run_parse_test_dump(
+        lfea_remainder_page
+    )
+    assert stats.light_feature_pages == 1
+    assert stats.light_feature_records == 1
+    assert stats.light_feature_payload_remainder_bytes == 5
+    assert len(light_feature_df) == 1
+
+    reboot_record_before = bytearray(light_feature_record)
+    struct.pack_into("<I", reboot_record_before, 4, 20000)
+    reboot_record_after = bytearray(light_feature_record)
+    struct.pack_into("<I", reboot_record_after, 0, 2)
+    struct.pack_into("<I", reboot_record_after, 4, 1000)
+    reboot_validation_df, reboot_validation = validate_light_feature_records(
+        [
+            parse_light_feature_record(bytes(reboot_record_before)),
+            parse_light_feature_record(bytes(reboot_record_after)),
+        ],
+        ParseStats(),
+    )
+    assert reboot_validation_df["boot_session"].tolist() == [0, 1]
+    assert reboot_validation["detected_boot_sessions"] == 2
+    assert reboot_validation["global_timestamp_regressions"] == 1
+    assert reboot_validation["recognized_timestamp_resets"] == 1
+    assert reboot_validation["non_monotonic_timestamps_within_sessions"] == 0
+    assert reboot_validation["unexpected_timestamp_regressions"] == 0
+    assert reboot_validation["final_result"] == "PASS"
+
+    unexpected_record_before = bytearray(light_feature_record)
+    struct.pack_into("<I", unexpected_record_before, 4, 20000)
+    unexpected_record_after = bytearray(light_feature_record)
+    struct.pack_into("<I", unexpected_record_after, 4, 10000)
+    unexpected_validation_df, unexpected_validation = validate_light_feature_records(
+        [
+            parse_light_feature_record(bytes(unexpected_record_before)),
+            parse_light_feature_record(bytes(unexpected_record_after)),
+        ],
+        ParseStats(),
+    )
+    assert unexpected_validation_df["boot_session"].tolist() == [0, 0]
+    assert unexpected_validation["global_timestamp_regressions"] == 1
+    assert unexpected_validation["recognized_timestamp_resets"] == 0
+    assert unexpected_validation["non_monotonic_timestamps_within_sessions"] == 1
+    assert unexpected_validation["unexpected_timestamp_regressions"] == 1
+    assert unexpected_validation["final_result"] == "FAIL"
+
+    for clear_counts, expected_class in (
+        (2, 0),
+        (3, 1),
+        (49, 1),
+        (50, 2),
+        (6499, 2),
+        (6500, 3),
+        (9799, 3),
+        (9800, 4),
+    ):
+        assert classify_light_with_hysteresis(clear_counts, None) == expected_class
+    assert classify_light_with_hysteresis(9400, 4) == 4
+    assert classify_light_with_hysteresis(9000, 4) == 3
+    assert classify_light_with_hysteresis(46, 2) == 1
+    assert classify_light_with_hysteresis(7000, 0) == 3
+    assert classify_light_with_hysteresis(9999, None) == 4
+    assert classify_light_with_hysteresis(10000, None) == 4
+    assert not (9999 >= LIGHT_SATURATION_CLEAR_COUNTS)
+    assert 10000 >= LIGHT_SATURATION_CLEAR_COUNTS
+    assert not parse_light_feature_record(light_feature_record)["flag_saturated"]
+    assert parse_light_feature_record(saturated_light_feature_record)["flag_saturated"]
 
     assert round_half_away_from_zero(1.5) == 2
     assert round_half_away_from_zero(-1.5) == -2
@@ -4660,7 +5666,7 @@ def run_internal_tests() -> None:
             page_sequence=len(tone_dump_pages),
         )
     )
-    _, _, _, _, stats, _ = _run_parse_test_dump(b"".join(tone_dump_pages))
+    _, _, _, _, _, stats, _ = _run_parse_test_dump(b"".join(tone_dump_pages))
     assert stats.audio_complete_windows == 1
     assert stats.audio_feature_paired_windows == 1
     assert stats.audio_feature_comparison_result == "PASS"
@@ -4690,22 +5696,22 @@ def run_internal_tests() -> None:
     assert parsed["nir_counts"] == 1000
 
     page = _make_test_page(header_size=PAGE_HEADER_SIZE, payload=record)
-    _, light_raw_df, _, _, stats, _ = _run_parse_test_dump(page)
+    _, light_raw_df, _, _, _, stats, _ = _run_parse_test_dump(page)
     assert stats.light_raw_records == 1
     assert int(light_raw_df["sample_elapsed_ms"].iloc[0]) == 1234
 
     page = _make_test_page(header_size=PAGE_HEADER_SIZE + 4, payload=record)
-    _, light_raw_df, _, _, stats, _ = _run_parse_test_dump(page)
+    _, light_raw_df, _, _, _, stats, _ = _run_parse_test_dump(page)
     assert stats.light_raw_records == 1
     assert int(light_raw_df["record_absolute_page_offset"].iloc[0]) == PAGE_HEADER_SIZE + 4
 
     page = _make_test_page(header_size=PAGE_HEADER_SIZE - 4, payload=record)
-    _, light_raw_df, _, _, stats, _ = _run_parse_test_dump(page)
+    _, light_raw_df, _, _, _, stats, _ = _run_parse_test_dump(page)
     assert stats.invalid_light_raw_pages == 1
     assert light_raw_df.empty
 
     page = _make_test_page(payload=record + b"XYZ")
-    _, light_raw_df, _, _, stats, _ = _run_parse_test_dump(page)
+    _, light_raw_df, _, _, _, stats, _ = _run_parse_test_dump(page)
     assert stats.light_raw_payload_remainder_bytes == 3
     assert stats.light_raw_records == 1
     assert len(light_raw_df) == 1
@@ -4757,7 +5763,7 @@ def run_internal_tests() -> None:
     assert "F5-F7" in identical_diagnostics["nearly_identical_channel_pairs"]
 
     no_lraw_page = _make_test_page(magic=MAGIC_SENSOR, payload=b"")
-    _, light_raw_df, _, _, stats, diagnostics = _run_parse_test_dump(no_lraw_page)
+    _, light_raw_df, _, _, _, stats, diagnostics = _run_parse_test_dump(no_lraw_page)
     assert stats.light_raw_pages == 0
     assert light_raw_df.empty
     assert list(light_raw_df.columns) == LIGHT_RAW_COLUMNS
@@ -4922,7 +5928,15 @@ def main(argv=None):
     )
 
     try:
-        imu_df, light_raw_df, light_df, audio_bytes, _, light_raw_diagnostics = parse_nand_dump(
+        (
+            imu_df,
+            light_raw_df,
+            light_df,
+            light_feature_df,
+            audio_bytes,
+            stats,
+            light_raw_diagnostics,
+        ) = parse_nand_dump(
             bin_filename=bin_filename,
             imu_csv_filename=imu_csv_filename,
             light_raw_csv_filename=light_raw_csv_filename,
@@ -4936,11 +5950,16 @@ def main(argv=None):
         plot_imu_data(imu_df, output_prefix)
         plot_light_raw_channels(light_raw_df, output_prefix, light_raw_diagnostics)
         plot_light_results(light_df, output_prefix)
+        plot_light_feature_records(light_feature_df, output_prefix)
         analyze_and_export_relative_light_level(
             light_raw_df=light_raw_df,
             output_prefix=output_prefix,
             summary_filename=summary_filename,
             diagnostics=light_raw_diagnostics,
+        )
+        print(
+            "LFEA embedded classification result: "
+            f"{stats.light_feature_validation_result}"
         )
 
     except Exception as exc:

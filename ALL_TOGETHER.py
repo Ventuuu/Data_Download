@@ -12,6 +12,7 @@ NAND page header:
 Page magic:
     b"SENS" -> IMU records, 40 bytes each; bytes 17..38 reserved
     b"AUD0" -> PCM int16 audio
+    b"AFEA" -> packed embedded audio feature records
     b"LRAW" -> AS7341 raw samples
     b"LITE" -> optional legacy AS7341 session result, 40-byte payload
 
@@ -30,6 +31,7 @@ binary dump, CSV, diagnostics report and summary are still written. Python can
 detect inconsistencies, but it cannot always prove the firmware-side cause.
 """
 
+import argparse
 import os
 import csv
 import struct
@@ -58,8 +60,75 @@ END_MARKER = b"LOGEND!!"
 
 MAGIC_SENSOR = b"SENS"
 MAGIC_AUDIO = b"AUD0"
+MAGIC_AUDIO_FEATURE = b"AFEA"
 MAGIC_LIGHT_RAW = b"LRAW"
 MAGIC_LIGHT = b"LITE"
+
+AUDIO_FEATURE_RECORD_VERSION = 1
+AUDIO_FEATURE_RECORD_SIZE = 24
+AUDIO_FEATURE_RECORD_FORMAT = "<IIHhhhhhHBB"
+AUDIO_DB_CENTI_INVALID = -32768
+AUDIO_WINDOW_SAMPLES = 24000
+AUDIO_WINDOW_BYTES = AUDIO_WINDOW_SAMPLES * 2
+AUDIO_WINDOW_EXPECTED_PAYLOAD_PATTERN = (2048,) * 23 + (896,)
+AUDIO_FEATURE_DB_TOLERANCE_DB = 0.02
+AUDIO_FEATURE_MEAN_TOLERANCE_COUNTS = 0
+
+AUDIO_FLAG_COMPLETE = 1 << 0
+AUDIO_FLAG_ACQUISITION_VALID = 1 << 1
+AUDIO_FLAG_A_WEIGHTED_VALID = 1 << 2
+AUDIO_FLAG_CLIPPED = 1 << 3
+AUDIO_FLAG_HIGH_LEVEL = 1 << 4
+AUDIO_FLAG_SILENT_OR_UNAVAILABLE = 1 << 5
+AUDIO_FLAG_IMPULSIVE_EVENT = 1 << 6
+AUDIO_FLAG_RESERVED = 1 << 7
+AUDIO_RECONSTRUCTIBLE_FLAG_MASK = 0x7F
+
+AUDIO_ENVIRONMENT_LABELS = {
+    0: "VERY_QUIET",
+    1: "QUIET",
+    2: "MODERATE",
+    3: "LIVELY",
+    4: "NOISY",
+    5: "VERY_NOISY",
+    6: "HIGH_EXPOSURE",
+    255: "UNAVAILABLE",
+}
+
+AUDIO_FEATURE_COLUMNS = [
+    "window_sequence", "window_start_ms", "sample_count", "mean_counts_rounded",
+    "rms_z_centi_dbfs", "rms_z_dbfs", "rms_a_centi_dbfs", "rms_a_dbfs",
+    "estimated_laeq_centi_dba", "estimated_laeq_dba",
+    "peak_centi_dbfs", "peak_dbfs", "clipped_sample_count",
+    "environment_class", "environment_label", "flags",
+    "flag_complete", "flag_acquisition_valid", "flag_a_weighted_valid",
+    "flag_clipped", "flag_high_level", "flag_silent_or_unavailable",
+    "flag_impulsive_event", "flag_reserved", "physical_page_index",
+    "page_sequence", "page_timestamp_ms", "record_index_in_page",
+    "record_payload_offset", "page_version", "page_header_size",
+    "page_payload_bytes",
+]
+
+AUDIO_WINDOW_COLUMNS = [
+    "audio_window_index", "audio_bytes", "audio_samples", "complete",
+    "structurally_valid", "first_physical_page", "last_physical_page",
+    "first_page_sequence", "last_page_sequence", "first_page_timestamp_ms",
+    "last_page_timestamp_ms", "payload_pattern",
+]
+
+AUDIO_FEATURE_COMPARISON_COLUMNS = [
+    "audio_window_index", "firmware_window_sequence", "firmware_window_start_ms",
+    "sample_count_firmware", "sample_count_python", "sample_count_match",
+    "mean_firmware_rounded", "mean_python", "mean_python_rounded", "mean_match",
+    "rms_z_firmware_dbfs", "rms_z_python_dbfs", "rms_z_error_db", "rms_z_match",
+    "rms_a_firmware_dbfs", "rms_a_python_iir_dbfs", "rms_a_error_db", "rms_a_match",
+    "laeq_firmware_dba", "laeq_python_dba", "laeq_error_db", "laeq_match",
+    "peak_firmware_dbfs", "peak_python_dbfs", "peak_error_db", "peak_match",
+    "clipped_firmware", "clipped_python", "clipped_match",
+    "environment_firmware", "environment_python", "environment_match",
+    "flags_firmware", "flags_python", "flags_compared_mask", "flags_match",
+    "overall_match",
+]
 
 LIGHT_RAW_RECORD_FORMAT = "<II10H"
 LIGHT_RAW_RECORD_SIZE = 28
@@ -73,6 +142,9 @@ NORMALIZATION_SCALE = 10000.0
 
 if struct.calcsize(LIGHT_RAW_RECORD_FORMAT) != LIGHT_RAW_RECORD_SIZE:
     raise RuntimeError("Unexpected LRAW record size")
+
+if struct.calcsize(AUDIO_FEATURE_RECORD_FORMAT) != AUDIO_FEATURE_RECORD_SIZE:
+    raise RuntimeError("Unexpected AFEA record size")
 
 if struct.calcsize(PAGE_HEADER_FORMAT) != PAGE_HEADER_SIZE:
     raise RuntimeError("Unexpected NAND page header size")
@@ -264,6 +336,12 @@ SPL_CALIBRATION_REFERENCE = "Smartphone sound level meter application"
 SPL_CALIBRATION_APPROXIMATE = True
 SPL_CALIBRATION_PHONE_LEVELS_DBZ = (59.0, 68.0, 76.0)
 SPL_CALIBRATION_SENSOR_LEVELS_DBFS = (-56.763, -46.350, -40.499)
+AUDIO_EMBEDDED_IIR_SAMPLE_RATE_HZ = 48000
+AUDIO_EMBEDDED_IIR_BIQUADS = (
+    (0.96525096525, -1.34730163086, 0.38205066561, -1.34730722798, 0.34905752979),
+    (0.94696969696, -1.89393939393, 0.94696969696, -1.89387049481, 0.89515976917),
+    (0.64666542810, -0.38362237137, -0.26304305672, -1.34730722798, 0.34905752979),
+)
 AUDIO_SOUND_LEVEL_WINDOW_S = 1.0
 AUDIO_SOUND_LEVEL_HOP_S = 1.0
 NIOSH_REFERENCE_LEVEL_DBA = 85.0
@@ -316,6 +394,205 @@ def u16_le(data: bytes) -> int:
 
 def i16_le(data: bytes) -> int:
     return struct.unpack("<h", data)[0]
+
+
+def _decode_db_centi(raw_value: int) -> float:
+    if raw_value == AUDIO_DB_CENTI_INVALID:
+        return float("nan")
+    return raw_value / 100.0
+
+
+def parse_audio_feature_record(record: bytes) -> dict:
+    if len(record) != AUDIO_FEATURE_RECORD_SIZE:
+        raise ValueError(
+            f"AFEA record must be {AUDIO_FEATURE_RECORD_SIZE} bytes; got {len(record)}"
+        )
+
+    (
+        window_sequence,
+        window_start_ms,
+        sample_count,
+        mean_counts_rounded,
+        rms_z_centi_dbfs,
+        rms_a_centi_dbfs,
+        estimated_laeq_centi_dba,
+        peak_centi_dbfs,
+        clipped_sample_count,
+        environment_class,
+        flags,
+    ) = struct.unpack(AUDIO_FEATURE_RECORD_FORMAT, record)
+
+    return {
+        "window_sequence": window_sequence,
+        "window_start_ms": window_start_ms,
+        "sample_count": sample_count,
+        "mean_counts_rounded": mean_counts_rounded,
+        "rms_z_centi_dbfs": rms_z_centi_dbfs,
+        "rms_z_dbfs": _decode_db_centi(rms_z_centi_dbfs),
+        "rms_a_centi_dbfs": rms_a_centi_dbfs,
+        "rms_a_dbfs": _decode_db_centi(rms_a_centi_dbfs),
+        "estimated_laeq_centi_dba": estimated_laeq_centi_dba,
+        "estimated_laeq_dba": _decode_db_centi(estimated_laeq_centi_dba),
+        "peak_centi_dbfs": peak_centi_dbfs,
+        "peak_dbfs": _decode_db_centi(peak_centi_dbfs),
+        "clipped_sample_count": clipped_sample_count,
+        "environment_class": environment_class,
+        "environment_label": AUDIO_ENVIRONMENT_LABELS.get(environment_class, "UNKNOWN"),
+        "flags": flags,
+        "flag_complete": bool(flags & AUDIO_FLAG_COMPLETE),
+        "flag_acquisition_valid": bool(flags & AUDIO_FLAG_ACQUISITION_VALID),
+        "flag_a_weighted_valid": bool(flags & AUDIO_FLAG_A_WEIGHTED_VALID),
+        "flag_clipped": bool(flags & AUDIO_FLAG_CLIPPED),
+        "flag_high_level": bool(flags & AUDIO_FLAG_HIGH_LEVEL),
+        "flag_silent_or_unavailable": bool(flags & AUDIO_FLAG_SILENT_OR_UNAVAILABLE),
+        "flag_impulsive_event": bool(flags & AUDIO_FLAG_IMPULSIVE_EVENT),
+        "flag_reserved": bool(flags & AUDIO_FLAG_RESERVED),
+    }
+
+
+def round_half_away_from_zero(value: float) -> int:
+    if not np.isfinite(value):
+        raise ValueError("Cannot round a non-finite value")
+    if value >= 0.0:
+        return int(np.floor(value + 0.5))
+    return int(np.ceil(value - 0.5))
+
+
+def encode_db_centi_like_firmware(value: float) -> int:
+    if not np.isfinite(value):
+        return AUDIO_DB_CENTI_INVALID
+    rounded = round_half_away_from_zero(float(value) * 100.0)
+    return min(32767, max(-32767, rounded))
+
+
+def encode_mean_counts_like_firmware(value: float) -> int:
+    if not np.isfinite(value):
+        return 0
+    rounded = round_half_away_from_zero(float(value))
+    return min(32767, max(-32768, rounded))
+
+
+def compute_audio_window_basic_metrics(audio: np.ndarray) -> dict:
+    samples = np.asarray(audio, dtype=np.int16)
+    if samples.size == 0:
+        raise ValueError("Cannot compute audio metrics from an empty window")
+
+    x = samples.astype(np.float64)
+    mean_counts = float(np.mean(x))
+    zero_mean = x - mean_counts
+    rms_counts = float(np.sqrt(np.mean(zero_mean ** 2)))
+    rms_dbfs = (
+        float(20.0 * np.log10(rms_counts / INT16_FULL_SCALE))
+        if rms_counts > 0.0
+        else float("-inf")
+    )
+    absolute_peak_counts = float(np.max(np.abs(x)))
+    peak_dbfs = (
+        float(20.0 * np.log10(absolute_peak_counts / INT16_FULL_SCALE))
+        if absolute_peak_counts > 0.0
+        else float("-inf")
+    )
+    clipped = (samples == -32768) | (samples == 32767)
+    clipped_sample_count = int(np.count_nonzero(clipped))
+
+    return {
+        "mean_counts": mean_counts,
+        "mean_counts_rounded": encode_mean_counts_like_firmware(mean_counts),
+        "rms_zero_mean_counts": rms_counts,
+        "rms_zero_mean_dbfs": rms_dbfs,
+        "absolute_peak_counts": int(absolute_peak_counts),
+        "peak_dbfs": peak_dbfs,
+        "clipped_sample_count": clipped_sample_count,
+        "clipped_sample_percentage": 100.0 * clipped_sample_count / samples.size,
+    }
+
+
+def compute_embedded_iir_a_weighted_metrics(
+    audio: np.ndarray,
+    sample_rate_hz: int,
+) -> dict:
+    if sample_rate_hz != AUDIO_EMBEDDED_IIR_SAMPLE_RATE_HZ:
+        raise ValueError(
+            "Embedded A-weighting comparison requires exactly "
+            f"{AUDIO_EMBEDDED_IIR_SAMPLE_RATE_HZ} Hz; got {sample_rate_hz} Hz"
+        )
+
+    samples = np.asarray(audio, dtype=np.int16)
+    if samples.size == 0:
+        raise ValueError("Cannot apply A-weighting to an empty audio window")
+
+    x = samples.astype(np.float64)
+    mean_counts = float(np.mean(x))
+    states = [[0.0, 0.0] for _ in AUDIO_EMBEDDED_IIR_BIQUADS]
+    weighted_energy = 0.0
+
+    # DF-II transposed, denominator 1 + a1*z^-1 + a2*z^-2.
+    for sample in x:
+        section_input = float(sample - mean_counts)
+        for section_index, (b0, b1, b2, a1, a2) in enumerate(
+            AUDIO_EMBEDDED_IIR_BIQUADS
+        ):
+            s1, s2 = states[section_index]
+            output = b0 * section_input + s1
+            next_s1 = b1 * section_input - a1 * output + s2
+            next_s2 = b2 * section_input - a2 * output
+            if not all(np.isfinite(value) for value in (output, next_s1, next_s2)):
+                raise ValueError("Non-finite state in embedded A-weighting cascade")
+            states[section_index] = [next_s1, next_s2]
+            section_input = output
+        weighted_energy += section_input * section_input
+        if not np.isfinite(weighted_energy) or weighted_energy < 0.0:
+            raise ValueError("Invalid accumulated A-weighted energy")
+
+    rms_counts = float(np.sqrt(weighted_energy / samples.size))
+    rms_dbfs = (
+        float(20.0 * np.log10(rms_counts / INT16_FULL_SCALE))
+        if rms_counts > 0.0
+        else float("-inf")
+    )
+    estimated_laeq_dba = (
+        rms_dbfs + SPL_CALIBRATION_OFFSET_DB
+        if np.isfinite(rms_dbfs)
+        else float("-inf")
+    )
+    return {
+        "a_weighted_rms_counts": rms_counts,
+        "a_weighted_rms_dbfs": rms_dbfs,
+        "estimated_laeq_dba": estimated_laeq_dba,
+    }
+
+
+def classify_embedded_audio_environment(estimated_laeq_dba: float) -> int:
+    if not np.isfinite(estimated_laeq_dba):
+        return 255
+    for class_index, threshold in enumerate(SOUND_ENVIRONMENT_THRESHOLDS_DBA):
+        if estimated_laeq_dba < threshold:
+            return class_index
+    return 6
+
+
+def build_expected_audio_flags(
+    *,
+    complete: bool,
+    acquisition_valid: bool,
+    a_weighting_valid: bool,
+    clipped_sample_count: int,
+    estimated_laeq_dba: float,
+) -> int:
+    flags = 0
+    if complete:
+        flags |= AUDIO_FLAG_COMPLETE
+    if acquisition_valid:
+        flags |= AUDIO_FLAG_ACQUISITION_VALID
+    if a_weighting_valid:
+        flags |= AUDIO_FLAG_A_WEIGHTED_VALID
+    if clipped_sample_count > 0:
+        flags |= AUDIO_FLAG_CLIPPED
+    if np.isfinite(estimated_laeq_dba) and estimated_laeq_dba >= 85.0:
+        flags |= AUDIO_FLAG_HIGH_LEVEL
+    if not a_weighting_valid:
+        flags |= AUDIO_FLAG_SILENT_OR_UNAVAILABLE
+    return flags
 
 
 def read_exact(ser: serial.Serial, n_bytes: int) -> bytes:
@@ -1812,6 +2089,7 @@ class ParseStats:
     total_pages: int = 0
     sensor_pages: int = 0
     audio_pages: int = 0
+    audio_feature_pages: int = 0
     light_raw_pages: int = 0
     light_pages: int = 0
     unknown_pages: int = 0
@@ -1819,6 +2097,16 @@ class ParseStats:
     light_raw_records: int = 0
     light_records: int = 0
     audio_bytes: int = 0
+    audio_feature_records: int = 0
+    audio_feature_payload_bytes: int = 0
+    invalid_audio_feature_pages: int = 0
+    invalid_audio_feature_records: int = 0
+    audio_feature_payload_remainder_bytes: int = 0
+    audio_complete_windows: int = 0
+    audio_partial_windows: int = 0
+    audio_feature_paired_windows: int = 0
+    audio_feature_comparison_failures: int = 0
+    audio_feature_comparison_result: str = "NOT AVAILABLE"
     invalid_light_raw_pages: int = 0
     empty_light_raw_pages: int = 0
     light_raw_payload_remainder_bytes: int = 0
@@ -2931,6 +3219,350 @@ def write_light_raw_diagnostics_report(
     return True
 
 
+def _format_audio_payload_pattern(payload_sizes: list[int]) -> str:
+    if not payload_sizes:
+        return "empty"
+    runs = []
+    run_value = payload_sizes[0]
+    run_count = 1
+    for value in payload_sizes[1:]:
+        if value == run_value:
+            run_count += 1
+        else:
+            runs.append(f"{run_count}x{run_value}")
+            run_value = value
+            run_count = 1
+    runs.append(f"{run_count}x{run_value}")
+    return " + ".join(runs)
+
+
+def reconstruct_audio_windows(audio_pages: list[dict]) -> tuple[list[dict], list[dict], list[str]]:
+    rows = []
+    complete_windows = []
+    warnings = []
+    current_pages = []
+    current_bytes = bytearray()
+
+    def finalize_current() -> None:
+        nonlocal current_pages, current_bytes
+        if not current_pages:
+            return
+
+        payload_sizes = [len(page["payload"]) for page in current_pages]
+        exact_size = len(current_bytes) == AUDIO_WINDOW_BYTES
+        pattern_valid = tuple(payload_sizes) == AUDIO_WINDOW_EXPECTED_PAYLOAD_PATTERN
+        structurally_valid = exact_size and pattern_valid
+        window_index = len(rows)
+        row = {
+            "audio_window_index": window_index,
+            "audio_bytes": len(current_bytes),
+            "audio_samples": len(current_bytes) // 2,
+            "complete": exact_size,
+            "structurally_valid": structurally_valid,
+            "first_physical_page": current_pages[0]["physical_page_index"],
+            "last_physical_page": current_pages[-1]["physical_page_index"],
+            "first_page_sequence": current_pages[0]["page_sequence"],
+            "last_page_sequence": current_pages[-1]["page_sequence"],
+            "first_page_timestamp_ms": current_pages[0]["page_timestamp_ms"],
+            "last_page_timestamp_ms": current_pages[-1]["page_timestamp_ms"],
+            "payload_pattern": _format_audio_payload_pattern(payload_sizes),
+        }
+        rows.append(row)
+
+        internal_window = dict(row)
+        internal_window["window_bytes"] = bytes(current_bytes)
+        if structurally_valid:
+            complete_windows.append(internal_window)
+        elif exact_size:
+            warnings.append(
+                f"AUD0 window {window_index} has 48000 bytes but unexpected "
+                f"payload pattern: {row['payload_pattern']}"
+            )
+        else:
+            warnings.append(
+                f"Incomplete AUD0 window {window_index}: {len(current_bytes)} bytes, "
+                f"pattern {row['payload_pattern']}"
+            )
+
+        current_pages = []
+        current_bytes = bytearray()
+
+    for page in audio_pages:
+        payload = page["payload"]
+        if len(current_bytes) + len(payload) > AUDIO_WINDOW_BYTES:
+            warnings.append(
+                f"AUD0 page_sequence={page['page_sequence']} would exceed "
+                f"{AUDIO_WINDOW_BYTES} bytes in the current window"
+            )
+            finalize_current()
+
+        current_pages.append(page)
+        current_bytes.extend(payload)
+        if len(current_bytes) == AUDIO_WINDOW_BYTES:
+            finalize_current()
+
+    finalize_current()
+    return rows, complete_windows, warnings
+
+
+def _db_error_and_match(firmware_value: float, python_value: float) -> tuple[float, bool]:
+    firmware_finite = bool(np.isfinite(firmware_value))
+    python_finite = bool(np.isfinite(python_value))
+    if not firmware_finite or not python_finite:
+        return float("nan"), firmware_finite == python_finite
+    error = float(firmware_value - python_value)
+    return error, abs(error) <= AUDIO_FEATURE_DB_TOLERANCE_DB
+
+
+def compare_audio_feature_records(
+    complete_windows: list[dict],
+    audio_feature_rows: list[dict],
+    sample_rate_hz: int,
+) -> tuple[pd.DataFrame, dict]:
+    warnings = []
+    sequences = [int(row["window_sequence"]) for row in audio_feature_rows]
+    sequence_monotonic = all(right > left for left, right in zip(sequences, sequences[1:]))
+    sequence_gaps = [
+        (left, right)
+        for left, right in zip(sequences, sequences[1:])
+        if right != left + 1
+    ]
+    if sequences and not sequence_monotonic:
+        warnings.append("AFEA window_sequence is not strictly monotonic")
+    if sequence_gaps:
+        warnings.append(f"AFEA window_sequence gaps: {sequence_gaps}")
+
+    paired_count = min(len(complete_windows), len(audio_feature_rows))
+    rows = []
+    for pair_index in range(paired_count):
+        window = complete_windows[pair_index]
+        firmware = audio_feature_rows[pair_index]
+        samples = np.frombuffer(window["window_bytes"], dtype="<i2")
+        basic = compute_audio_window_basic_metrics(samples)
+
+        try:
+            weighted = compute_embedded_iir_a_weighted_metrics(samples, sample_rate_hz)
+        except ValueError as exc:
+            warnings.append(f"Window {window['audio_window_index']}: {exc}")
+            weighted = {
+                "a_weighted_rms_counts": 0.0,
+                "a_weighted_rms_dbfs": float("-inf"),
+                "estimated_laeq_dba": float("-inf"),
+            }
+
+        python_environment = classify_embedded_audio_environment(
+            weighted["estimated_laeq_dba"]
+        )
+        a_weighting_valid = bool(
+            np.isfinite(weighted["a_weighted_rms_dbfs"])
+            and np.isfinite(weighted["estimated_laeq_dba"])
+        )
+        python_flags = build_expected_audio_flags(
+            complete=True,
+            acquisition_valid=True,
+            a_weighting_valid=a_weighting_valid,
+            clipped_sample_count=basic["clipped_sample_count"],
+            estimated_laeq_dba=weighted["estimated_laeq_dba"],
+        )
+
+        rms_z_error, rms_z_match = _db_error_and_match(
+            firmware["rms_z_dbfs"], basic["rms_zero_mean_dbfs"]
+        )
+        rms_a_error, rms_a_match = _db_error_and_match(
+            firmware["rms_a_dbfs"], weighted["a_weighted_rms_dbfs"]
+        )
+        laeq_error, laeq_match = _db_error_and_match(
+            firmware["estimated_laeq_dba"], weighted["estimated_laeq_dba"]
+        )
+        peak_error, peak_match = _db_error_and_match(
+            firmware["peak_dbfs"], basic["peak_dbfs"]
+        )
+
+        sample_count_match = int(firmware["sample_count"]) == int(samples.size)
+        mean_match = (
+            abs(int(firmware["mean_counts_rounded"]) - basic["mean_counts_rounded"])
+            <= AUDIO_FEATURE_MEAN_TOLERANCE_COUNTS
+        )
+        clipped_match = (
+            int(firmware["clipped_sample_count"]) == basic["clipped_sample_count"]
+        )
+        environment_match = int(firmware["environment_class"]) == python_environment
+        flags_match = (
+            int(firmware["flags"]) & AUDIO_RECONSTRUCTIBLE_FLAG_MASK
+        ) == (python_flags & AUDIO_RECONSTRUCTIBLE_FLAG_MASK)
+        overall_match = all(
+            (
+                sample_count_match,
+                mean_match,
+                rms_z_match,
+                rms_a_match,
+                laeq_match,
+                peak_match,
+                clipped_match,
+                environment_match,
+                flags_match,
+            )
+        )
+
+        rows.append(
+            {
+                "audio_window_index": window["audio_window_index"],
+                "firmware_window_sequence": firmware["window_sequence"],
+                "firmware_window_start_ms": firmware["window_start_ms"],
+                "sample_count_firmware": firmware["sample_count"],
+                "sample_count_python": int(samples.size),
+                "sample_count_match": sample_count_match,
+                "mean_firmware_rounded": firmware["mean_counts_rounded"],
+                "mean_python": basic["mean_counts"],
+                "mean_python_rounded": basic["mean_counts_rounded"],
+                "mean_match": mean_match,
+                "rms_z_firmware_dbfs": firmware["rms_z_dbfs"],
+                "rms_z_python_dbfs": basic["rms_zero_mean_dbfs"],
+                "rms_z_error_db": rms_z_error,
+                "rms_z_match": rms_z_match,
+                "rms_a_firmware_dbfs": firmware["rms_a_dbfs"],
+                "rms_a_python_iir_dbfs": weighted["a_weighted_rms_dbfs"],
+                "rms_a_error_db": rms_a_error,
+                "rms_a_match": rms_a_match,
+                "laeq_firmware_dba": firmware["estimated_laeq_dba"],
+                "laeq_python_dba": weighted["estimated_laeq_dba"],
+                "laeq_error_db": laeq_error,
+                "laeq_match": laeq_match,
+                "peak_firmware_dbfs": firmware["peak_dbfs"],
+                "peak_python_dbfs": basic["peak_dbfs"],
+                "peak_error_db": peak_error,
+                "peak_match": peak_match,
+                "clipped_firmware": firmware["clipped_sample_count"],
+                "clipped_python": basic["clipped_sample_count"],
+                "clipped_match": clipped_match,
+                "environment_firmware": firmware["environment_class"],
+                "environment_python": python_environment,
+                "environment_match": environment_match,
+                "flags_firmware": firmware["flags"],
+                "flags_python": python_flags,
+                "flags_compared_mask": AUDIO_RECONSTRUCTIBLE_FLAG_MASK,
+                "flags_match": flags_match,
+                "overall_match": overall_match,
+            }
+        )
+
+    comparison_df = pd.DataFrame(rows, columns=AUDIO_FEATURE_COMPARISON_COLUMNS)
+    unpaired_windows = len(complete_windows) - paired_count
+    unpaired_records = len(audio_feature_rows) - paired_count
+    row_failures = int((~comparison_df["overall_match"]).sum()) if not comparison_df.empty else 0
+    sequence_issue_count = int(not sequence_monotonic) + len(sequence_gaps)
+
+    if paired_count == 0:
+        final_result = "NOT AVAILABLE"
+    elif row_failures or unpaired_windows or unpaired_records or sequence_issue_count:
+        final_result = "FAIL"
+    else:
+        final_result = "PASS"
+
+    def max_abs_error(column: str) -> float:
+        if comparison_df.empty:
+            return float("nan")
+        values = np.abs(pd.to_numeric(comparison_df[column], errors="coerce").to_numpy(float))
+        finite = values[np.isfinite(values)]
+        return float(np.max(finite)) if finite.size else float("nan")
+
+    summary = {
+        "paired_windows": paired_count,
+        "unpaired_audio_windows": unpaired_windows,
+        "unpaired_audio_feature_records": unpaired_records,
+        "window_sequence_offset": sequences[0] if sequences else None,
+        "window_sequence_monotonic": sequence_monotonic,
+        "window_sequence_gaps": sequence_gaps,
+        "max_abs_rms_z_error_db": max_abs_error("rms_z_error_db"),
+        "max_abs_rms_a_error_db": max_abs_error("rms_a_error_db"),
+        "max_abs_laeq_error_db": max_abs_error("laeq_error_db"),
+        "max_abs_peak_error_db": max_abs_error("peak_error_db"),
+        "sample_count_mismatches": int((~comparison_df["sample_count_match"]).sum()) if not comparison_df.empty else 0,
+        "mean_mismatches": int((~comparison_df["mean_match"]).sum()) if not comparison_df.empty else 0,
+        "clipping_mismatches": int((~comparison_df["clipped_match"]).sum()) if not comparison_df.empty else 0,
+        "class_mismatches": int((~comparison_df["environment_match"]).sum()) if not comparison_df.empty else 0,
+        "flag_mismatches": int((~comparison_df["flags_match"]).sum()) if not comparison_df.empty else 0,
+        "comparison_failures": row_failures + unpaired_windows + unpaired_records + sequence_issue_count,
+        "final_result": final_result,
+        "warnings": warnings,
+    }
+    return comparison_df, summary
+
+
+def write_audio_feature_comparison_report(
+    report_filename: Path,
+    stats: ParseStats,
+    audio_window_rows: list[dict],
+    comparison_df: pd.DataFrame,
+    comparison_summary: dict,
+) -> None:
+    lines = [
+        "Audio feature comparison",
+        f"AFEA pages: {stats.audio_feature_pages}",
+        f"AFEA records: {stats.audio_feature_records}",
+        f"AFEA payload bytes: {stats.audio_feature_payload_bytes}",
+        f"AFEA invalid pages: {stats.invalid_audio_feature_pages}",
+        f"AFEA invalid records: {stats.invalid_audio_feature_records}",
+        f"AFEA remainder bytes: {stats.audio_feature_payload_remainder_bytes}",
+        f"AUD0 complete windows: {stats.audio_complete_windows}",
+        f"AUD0 partial windows: {stats.audio_partial_windows}",
+        f"Paired windows: {comparison_summary['paired_windows']}",
+        f"Unpaired AUD0 windows: {comparison_summary['unpaired_audio_windows']}",
+        f"Unpaired AFEA records: {comparison_summary['unpaired_audio_feature_records']}",
+        f"AFEA sequence initial offset: {comparison_summary['window_sequence_offset']}",
+        f"AFEA sequence monotonic: {comparison_summary['window_sequence_monotonic']}",
+        f"AFEA sequence gaps: {comparison_summary['window_sequence_gaps']}",
+        f"Maximum absolute RMS Z error: {comparison_summary['max_abs_rms_z_error_db']} dB",
+        f"Maximum absolute RMS A error: {comparison_summary['max_abs_rms_a_error_db']} dB",
+        f"Maximum absolute LAeq error: {comparison_summary['max_abs_laeq_error_db']} dB",
+        f"Maximum absolute peak error: {comparison_summary['max_abs_peak_error_db']} dB",
+        f"Sample count mismatches: {comparison_summary['sample_count_mismatches']}",
+        f"Mean mismatches: {comparison_summary['mean_mismatches']}",
+        f"Clipping mismatches: {comparison_summary['clipping_mismatches']}",
+        f"Class mismatches: {comparison_summary['class_mismatches']}",
+        f"Flag mismatches: {comparison_summary['flag_mismatches']}",
+        "Flag comparison mask: 0x7F (bits 0..6; reserved bit 7 excluded)",
+        "",
+        "AUD0 window layouts:",
+    ]
+    for window in audio_window_rows:
+        lines.append(
+            f"  Window {window['audio_window_index']}: bytes={window['audio_bytes']}, "
+            f"complete={window['complete']}, valid={window['structurally_valid']}, "
+            f"pattern={window['payload_pattern']}"
+        )
+    lines.append("")
+    lines.extend(f"Warning: {warning}" for warning in comparison_summary["warnings"])
+    if comparison_summary["warnings"]:
+        lines.append("")
+
+    for row in comparison_df.to_dict("records"):
+        lines.extend(
+            [
+                f"Window {row['audio_window_index']} / sequence {row['firmware_window_sequence']}:",
+                f"  RMS Z error = {row['rms_z_error_db']}",
+                f"  RMS A error = {row['rms_a_error_db']}",
+                f"  LAeq error = {row['laeq_error_db']}",
+                f"  Peak error = {row['peak_error_db']}",
+                f"  class match = {row['environment_match']}",
+                f"  flags match = {row['flags_match']}",
+                f"  {'PASS' if row['overall_match'] else 'FAIL'}",
+            ]
+        )
+
+    lines.extend(["", f"Overall result: {comparison_summary['final_result']}"])
+    report_filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _output_prefix_from_summary(summary_filename: Path) -> Path:
+    suffix = "_summary.txt"
+    if summary_filename.name.endswith(suffix):
+        prefix_name = summary_filename.name[:-len(suffix)]
+    else:
+        prefix_name = summary_filename.stem
+    return summary_filename.with_name(prefix_name)
+
+
 def parse_nand_dump(
     bin_filename: Path,
     imu_csv_filename: Path,
@@ -2944,6 +3576,8 @@ def parse_nand_dump(
     sensor_rows = []
     light_raw_rows = []
     light_rows = []
+    audio_feature_rows = []
+    audio_pages = []
     audio_bytes = bytearray()
     light_raw_debug_records = []
     first_light_record_field_map = ""
@@ -2981,8 +3615,11 @@ def parse_nand_dump(
 
             magic = struct.pack("<I", magic_word)
             is_light_raw_page = magic == MAGIC_LIGHT_RAW
+            is_audio_feature_page = magic == MAGIC_AUDIO_FEATURE
             if is_light_raw_page:
                 stats.light_raw_pages += 1
+            if is_audio_feature_page:
+                stats.audio_feature_pages += 1
 
             if header_size != PAGE_HEADER_SIZE:
                 print(
@@ -2997,6 +3634,8 @@ def parse_nand_dump(
                 )
                 if is_light_raw_page:
                     stats.invalid_light_raw_pages += 1
+                elif is_audio_feature_page:
+                    stats.invalid_audio_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3009,6 +3648,8 @@ def parse_nand_dump(
                 )
                 if is_light_raw_page:
                     stats.invalid_light_raw_pages += 1
+                elif is_audio_feature_page:
+                    stats.invalid_audio_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3021,6 +3662,8 @@ def parse_nand_dump(
                 )
                 if is_light_raw_page:
                     stats.invalid_light_raw_pages += 1
+                elif is_audio_feature_page:
+                    stats.invalid_audio_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3035,6 +3678,8 @@ def parse_nand_dump(
                 )
                 if is_light_raw_page:
                     stats.invalid_light_raw_pages += 1
+                elif is_audio_feature_page:
+                    stats.invalid_audio_feature_pages += 1
                 else:
                     stats.unknown_pages += 1
                 physical_page_index += 1
@@ -3064,6 +3709,59 @@ def parse_nand_dump(
             elif magic == MAGIC_AUDIO:
                 stats.audio_pages += 1
                 audio_bytes.extend(payload)
+                audio_pages.append(
+                    {
+                        "payload": bytes(payload),
+                        "physical_page_index": physical_page_index,
+                        "page_sequence": page_sequence,
+                        "page_timestamp_ms": page_timestamp_ms,
+                    }
+                )
+
+            elif magic == MAGIC_AUDIO_FEATURE:
+                if version != AUDIO_FEATURE_RECORD_VERSION:
+                    print(
+                        f"Warning: AFEA page_sequence={page_sequence} has version={version}; "
+                        f"expected {AUDIO_FEATURE_RECORD_VERSION}; page skipped"
+                    )
+                    stats.invalid_audio_feature_pages += 1
+                    physical_page_index += 1
+                    continue
+
+                stats.audio_feature_payload_bytes += payload_bytes
+                n_records = payload_bytes // AUDIO_FEATURE_RECORD_SIZE
+                remainder = payload_bytes % AUDIO_FEATURE_RECORD_SIZE
+                if payload_bytes == 0:
+                    print(f"Warning: empty AFEA page at page_sequence={page_sequence}")
+                    stats.invalid_audio_feature_pages += 1
+                if remainder:
+                    print(
+                        f"Warning: AFEA page_sequence={page_sequence} has "
+                        f"payload_bytes={payload_bytes}; ignoring {remainder} trailing byte(s)"
+                    )
+                    stats.invalid_audio_feature_pages += 1
+                    stats.audio_feature_payload_remainder_bytes += int(remainder)
+
+                for record_index_in_page in range(n_records):
+                    record_start = record_index_in_page * AUDIO_FEATURE_RECORD_SIZE
+                    record_end = record_start + AUDIO_FEATURE_RECORD_SIZE
+                    record = payload[record_start:record_end]
+                    try:
+                        parsed = parse_audio_feature_record(record)
+                    except (ValueError, struct.error) as exc:
+                        print(f"Warning: invalid AFEA record skipped: {exc}")
+                        stats.invalid_audio_feature_records += 1
+                        continue
+
+                    parsed["physical_page_index"] = physical_page_index
+                    parsed["page_sequence"] = page_sequence
+                    parsed["page_timestamp_ms"] = page_timestamp_ms
+                    parsed["record_index_in_page"] = record_index_in_page
+                    parsed["record_payload_offset"] = record_start
+                    parsed["page_version"] = version
+                    parsed["page_header_size"] = header_size
+                    parsed["page_payload_bytes"] = payload_bytes
+                    audio_feature_rows.append(parsed)
 
             elif magic == MAGIC_LIGHT_RAW:
                 if payload_bytes == 0:
@@ -3172,6 +3870,55 @@ def parse_nand_dump(
     stats.light_raw_records = len(light_raw_rows)
     stats.light_records = len(light_rows)
     stats.audio_bytes = len(audio_bytes)
+    stats.audio_feature_records = len(audio_feature_rows)
+
+    audio_window_rows, complete_audio_windows, audio_window_warnings = (
+        reconstruct_audio_windows(audio_pages)
+    )
+    for warning in audio_window_warnings:
+        print(f"Warning: {warning}")
+    stats.audio_complete_windows = len(complete_audio_windows)
+    stats.audio_partial_windows = len(audio_window_rows) - len(complete_audio_windows)
+
+    audio_feature_df = pd.DataFrame(audio_feature_rows, columns=AUDIO_FEATURE_COLUMNS)
+    audio_window_df = pd.DataFrame(audio_window_rows, columns=AUDIO_WINDOW_COLUMNS)
+    comparison_df, comparison_summary = compare_audio_feature_records(
+        complete_windows=complete_audio_windows,
+        audio_feature_rows=audio_feature_rows,
+        sample_rate_hz=audio_sample_rate_hz,
+    )
+    structural_failure_count = (
+        stats.audio_partial_windows
+        + stats.invalid_audio_feature_pages
+        + stats.invalid_audio_feature_records
+    )
+    if structural_failure_count:
+        comparison_summary["comparison_failures"] += structural_failure_count
+        comparison_summary["warnings"].append(
+            "Structural audio anomalies: "
+            f"AUD0={stats.audio_partial_windows}, "
+            f"AFEA pages={stats.invalid_audio_feature_pages}, "
+            f"AFEA records={stats.invalid_audio_feature_records}"
+        )
+        if comparison_summary["paired_windows"]:
+            comparison_summary["final_result"] = "FAIL"
+    for warning in comparison_summary["warnings"]:
+        print(f"Warning: {warning}")
+
+    stats.audio_feature_paired_windows = comparison_summary["paired_windows"]
+    stats.audio_feature_comparison_failures = comparison_summary["comparison_failures"]
+    stats.audio_feature_comparison_result = comparison_summary["final_result"]
+
+    output_prefix = _output_prefix_from_summary(summary_filename)
+    audio_feature_csv_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_records.csv"
+    )
+    audio_feature_comparison_csv_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_comparison.csv"
+    )
+    audio_feature_comparison_report_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_comparison.txt"
+    )
 
     imu_df = pd.DataFrame(sensor_rows)
     light_raw_df = pd.DataFrame(light_raw_rows, columns=LIGHT_RAW_COLUMNS)
@@ -3212,6 +3959,15 @@ def parse_nand_dump(
     imu_df.to_csv(imu_csv_filename, index=False)
     light_raw_df.to_csv(light_raw_csv_filename, index=False)
     light_df.to_csv(light_csv_filename, index=False)
+    audio_feature_df.to_csv(audio_feature_csv_filename, index=False)
+    comparison_df.to_csv(audio_feature_comparison_csv_filename, index=False)
+    write_audio_feature_comparison_report(
+        report_filename=audio_feature_comparison_report_filename,
+        stats=stats,
+        audio_window_rows=audio_window_rows,
+        comparison_df=comparison_df,
+        comparison_summary=comparison_summary,
+    )
 
     report_written = write_light_raw_diagnostics_report(
         report_filename=light_raw_diagnostics_filename,
@@ -3252,6 +4008,19 @@ def parse_nand_dump(
         f"Audio bytes: {stats.audio_bytes}\n"
         f"Audio samples: {stats.audio_bytes // 2}\n"
         f"Audio sample rate: {audio_sample_rate_hz} Hz\n"
+        "\nAudio feature records\n"
+        f"AFEA pages: {stats.audio_feature_pages}\n"
+        f"AFEA records: {stats.audio_feature_records}\n"
+        f"AFEA payload bytes: {stats.audio_feature_payload_bytes}\n"
+        f"AFEA payload remainder: {stats.audio_feature_payload_remainder_bytes}\n"
+        f"AUD0 complete windows: {stats.audio_complete_windows}\n"
+        f"AUD0 partial windows: {stats.audio_partial_windows}\n"
+        f"AFEA comparison paired windows: {stats.audio_feature_paired_windows}\n"
+        f"AFEA comparison failures: {stats.audio_feature_comparison_failures}\n"
+        f"AFEA comparison final result: {stats.audio_feature_comparison_result}\n"
+        f"AFEA CSV filename: {audio_feature_csv_filename.name}\n"
+        f"AFEA comparison CSV filename: {audio_feature_comparison_csv_filename.name}\n"
+        f"AFEA comparison report filename: {audio_feature_comparison_report_filename.name}\n"
         f"IMU CSV file: {imu_csv_filename.name}\n"
         f"Light raw CSV file: {light_raw_csv_filename.name}\n"
         f"Legacy light CSV file: {light_csv_filename.name}\n"
@@ -3305,6 +4074,9 @@ def parse_nand_dump(
     print(f"IMU CSV saved to: {imu_csv_filename}")
     print(f"Light raw CSV saved to: {light_raw_csv_filename}")
     print(f"Legacy light CSV saved to: {light_csv_filename}")
+    print(f"Audio feature CSV saved to: {audio_feature_csv_filename}")
+    print(f"Audio feature comparison CSV saved to: {audio_feature_comparison_csv_filename}")
+    print(f"Audio feature comparison report saved to: {audio_feature_comparison_report_filename}")
     if audio_metrics is not None:
         print(f"Audio WAV saved to: {wav_filename}")
     print(f"Summary saved to: {summary_filename}")
@@ -3763,6 +4535,136 @@ def _run_parse_test_dump(dump_bytes: bytes):
 
 
 def run_internal_tests() -> None:
+    audio_feature_record = struct.pack(
+        AUDIO_FEATURE_RECORD_FORMAT,
+        7,
+        123456,
+        AUDIO_WINDOW_SAMPLES,
+        -12,
+        -4321,
+        -4567,
+        6789,
+        -100,
+        2,
+        4,
+        0x1F,
+    )
+    assert len(audio_feature_record) == AUDIO_FEATURE_RECORD_SIZE
+    assert struct.unpack_from("<I", audio_feature_record, 0)[0] == 7
+    assert struct.unpack_from("<I", audio_feature_record, 4)[0] == 123456
+    assert struct.unpack_from("<H", audio_feature_record, 8)[0] == AUDIO_WINDOW_SAMPLES
+    assert struct.unpack_from("<h", audio_feature_record, 10)[0] == -12
+    assert struct.unpack_from("<h", audio_feature_record, 12)[0] == -4321
+    assert struct.unpack_from("<h", audio_feature_record, 14)[0] == -4567
+    assert struct.unpack_from("<h", audio_feature_record, 16)[0] == 6789
+    assert struct.unpack_from("<h", audio_feature_record, 18)[0] == -100
+    assert struct.unpack_from("<H", audio_feature_record, 20)[0] == 2
+    assert audio_feature_record[22] == 4
+    assert audio_feature_record[23] == 0x1F
+
+    parsed_audio_feature = parse_audio_feature_record(audio_feature_record)
+    assert parsed_audio_feature["window_sequence"] == 7
+    assert parsed_audio_feature["rms_z_dbfs"] == -43.21
+    assert parsed_audio_feature["environment_label"] == "NOISY"
+    assert parsed_audio_feature["flag_complete"]
+    assert parsed_audio_feature["flag_high_level"]
+
+    second_audio_feature_record = struct.pack(
+        AUDIO_FEATURE_RECORD_FORMAT,
+        8,
+        133456,
+        AUDIO_WINDOW_SAMPLES,
+        0,
+        -4000,
+        -4200,
+        8000,
+        -50,
+        0,
+        5,
+        0x07,
+    )
+    afea_page = _make_test_page(
+        magic=MAGIC_AUDIO_FEATURE,
+        payload=audio_feature_record + second_audio_feature_record,
+    )
+    _, _, _, _, stats, _ = _run_parse_test_dump(afea_page)
+    assert stats.audio_feature_pages == 1
+    assert stats.audio_feature_records == 2
+    assert stats.audio_feature_payload_bytes == 48
+
+    afea_remainder_page = _make_test_page(
+        magic=MAGIC_AUDIO_FEATURE,
+        payload=audio_feature_record + b"XYZ",
+    )
+    _, _, _, _, stats, _ = _run_parse_test_dump(afea_remainder_page)
+    assert stats.audio_feature_records == 1
+    assert stats.audio_feature_payload_bytes == 27
+    assert stats.audio_feature_payload_remainder_bytes == 3
+
+    assert round_half_away_from_zero(1.5) == 2
+    assert round_half_away_from_zero(-1.5) == -2
+    assert encode_db_centi_like_firmware(float("nan")) == AUDIO_DB_CENTI_INVALID
+    assert encode_db_centi_like_firmware(float("inf")) == AUDIO_DB_CENTI_INVALID
+
+    test_time = np.arange(AUDIO_WINDOW_SAMPLES, dtype=np.float64) / 48000.0
+    test_tone = np.asarray(
+        10000.0 * np.sin(2.0 * np.pi * 1000.0 * test_time),
+        dtype=np.int16,
+    )
+    tone_basic = compute_audio_window_basic_metrics(test_tone)
+    tone_weighted = compute_embedded_iir_a_weighted_metrics(test_tone, 48000)
+    assert abs(
+        tone_weighted["a_weighted_rms_dbfs"] - tone_basic["rms_zero_mean_dbfs"]
+    ) < 0.01
+
+    tone_environment = classify_embedded_audio_environment(
+        tone_weighted["estimated_laeq_dba"]
+    )
+    tone_flags = build_expected_audio_flags(
+        complete=True,
+        acquisition_valid=True,
+        a_weighting_valid=True,
+        clipped_sample_count=tone_basic["clipped_sample_count"],
+        estimated_laeq_dba=tone_weighted["estimated_laeq_dba"],
+    )
+    tone_feature_record = struct.pack(
+        AUDIO_FEATURE_RECORD_FORMAT,
+        1,
+        1000,
+        AUDIO_WINDOW_SAMPLES,
+        tone_basic["mean_counts_rounded"],
+        encode_db_centi_like_firmware(tone_basic["rms_zero_mean_dbfs"]),
+        encode_db_centi_like_firmware(tone_weighted["a_weighted_rms_dbfs"]),
+        encode_db_centi_like_firmware(tone_weighted["estimated_laeq_dba"]),
+        encode_db_centi_like_firmware(tone_basic["peak_dbfs"]),
+        tone_basic["clipped_sample_count"],
+        tone_environment,
+        tone_flags,
+    )
+    tone_bytes = test_tone.astype("<i2", copy=False).tobytes()
+    tone_dump_pages = []
+    offset = 0
+    for page_index, payload_size in enumerate(AUDIO_WINDOW_EXPECTED_PAYLOAD_PATTERN):
+        tone_dump_pages.append(
+            _make_test_page(
+                magic=MAGIC_AUDIO,
+                payload=tone_bytes[offset:offset + payload_size],
+                page_sequence=page_index,
+            )
+        )
+        offset += payload_size
+    tone_dump_pages.append(
+        _make_test_page(
+            magic=MAGIC_AUDIO_FEATURE,
+            payload=tone_feature_record,
+            page_sequence=len(tone_dump_pages),
+        )
+    )
+    _, _, _, _, stats, _ = _run_parse_test_dump(b"".join(tone_dump_pages))
+    assert stats.audio_complete_windows == 1
+    assert stats.audio_feature_paired_windows == 1
+    assert stats.audio_feature_comparison_result == "PASS"
+
     record = struct.pack(
         "<II10H",
         1234,
@@ -3892,7 +4794,7 @@ def run_internal_tests() -> None:
     assert assessment is not None
     assert classification_df["light_level_label"].tolist() == [
         "DARK",
-        "DARK",
+        "LOW_EXPOSURE",
         "LOW_EXPOSURE",
         "LOW_EXPOSURE",
         "LOW_EXPOSURE",
@@ -3935,17 +4837,79 @@ def run_internal_tests() -> None:
     print("Internal synthetic tests passed.")
 
 
-def main():
-    com_port, save_folder, baud_rate, audio_sample_rate = gui_select_com_and_folder()
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download or analyze Smart Eyewear NAND dumps."
+    )
+    parser.add_argument(
+        "--dump",
+        type=Path,
+        help="Analyze an existing NAND dump without opening the serial GUI.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Output directory for --dump mode; defaults to the dump directory.",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=DEFAULT_AUDIO_SAMPLE_RATE,
+        help=f"Audio sample rate for --dump mode (default: {DEFAULT_AUDIO_SAMPLE_RATE}).",
+    )
+    parser.add_argument(
+        "--run-internal-tests",
+        action="store_true",
+        help="Run synthetic parser and DSP tests, then exit.",
+    )
+    return parser
 
-    if not com_port or save_folder is None:
-        print("Application stopped.")
+
+def main(argv=None):
+    args = _build_cli_parser().parse_args(argv)
+    if args.run_internal_tests:
+        run_internal_tests()
         return
 
-    timestamp = datetime.now().strftime("SmartEyewear_%Y%m%d_%H%M%S")
-    output_prefix = save_folder / timestamp
+    offline_mode = args.dump is not None
+    if offline_mode:
+        bin_filename = args.dump.expanduser().resolve()
+        if not bin_filename.is_file():
+            print(f"Processing error: dump file not found: {bin_filename}")
+            return
+        save_folder = (
+            args.output_dir.expanduser().resolve()
+            if args.output_dir is not None
+            else bin_filename.parent
+        )
+        save_folder.mkdir(parents=True, exist_ok=True)
+        prefix_name = bin_filename.name
+        if prefix_name.endswith("_nand_dump.bin"):
+            prefix_name = prefix_name[:-len("_nand_dump.bin")]
+        else:
+            prefix_name = bin_filename.stem
+        output_prefix = save_folder / prefix_name
+        audio_sample_rate = args.audio_sample_rate
+    else:
+        com_port, save_folder, baud_rate, audio_sample_rate = gui_select_com_and_folder()
+        if not com_port or save_folder is None:
+            print("Application stopped.")
+            return
 
-    bin_filename = output_prefix.with_name(output_prefix.name + "_nand_dump.bin")
+        timestamp = datetime.now().strftime("SmartEyewear_%Y%m%d_%H%M%S")
+        output_prefix = save_folder / timestamp
+        bin_filename = output_prefix.with_name(output_prefix.name + "_nand_dump.bin")
+        try:
+            receive_and_save_data(
+                com_port=com_port,
+                baud_rate=baud_rate,
+                bin_filename=bin_filename,
+            )
+        except (serial.SerialException, TimeoutError, RuntimeError) as exc:
+            messagebox.showerror("Download error", str(exc))
+            print(f"Download error: {exc}")
+            return
+
     imu_csv_filename = output_prefix.with_name(output_prefix.name + "_imu.csv")
     light_raw_csv_filename = output_prefix.with_name(
         output_prefix.name + "_light_raw_counts.csv"
@@ -3956,17 +4920,6 @@ def main():
     light_raw_diagnostics_filename = output_prefix.with_name(
         output_prefix.name + "_light_raw_diagnostics.txt"
     )
-
-    try:
-        receive_and_save_data(
-            com_port=com_port,
-            baud_rate=baud_rate,
-            bin_filename=bin_filename,
-        )
-    except (serial.SerialException, TimeoutError, RuntimeError) as exc:
-        messagebox.showerror("Download error", str(exc))
-        print(f"Download error: {exc}")
-        return
 
     try:
         imu_df, light_raw_df, light_df, audio_bytes, _, light_raw_diagnostics = parse_nand_dump(
@@ -3991,15 +4944,19 @@ def main():
         )
 
     except Exception as exc:
-        messagebox.showerror("Processing error", str(exc))
+        if not offline_mode:
+            messagebox.showerror("Processing error", str(exc))
         print(f"Processing error: {exc}")
         return
 
-    messagebox.showinfo(
-        "Completed",
-        "Download and processing completed.\n\n"
-        f"Files saved in:\n{save_folder}"
-    )
+    if offline_mode:
+        print(f"Offline processing completed. Files saved in: {save_folder}")
+    else:
+        messagebox.showinfo(
+            "Completed",
+            "Download and processing completed.\n\n"
+            f"Files saved in:\n{save_folder}"
+        )
 
 
 if __name__ == "__main__":

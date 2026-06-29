@@ -32,6 +32,7 @@ detect inconsistencies, but it cannot always prove the firmware-side cause.
 """
 
 import argparse
+import binascii
 import os
 import csv
 import struct
@@ -133,6 +134,46 @@ AUDIO_ENVIRONMENT_LABELS = {
     255: "UNAVAILABLE",
 }
 
+AUDIO_ENVIRONMENT_CLASS_NAMES = {
+    0: "SOUND_VERY_QUIET",
+    1: "SOUND_QUIET",
+    2: "SOUND_MODERATE",
+    3: "SOUND_LIVELY",
+    4: "SOUND_NOISY",
+    5: "SOUND_VERY_NOISY",
+    6: "SOUND_HIGH_EXPOSURE",
+}
+
+AUDIO_ENVIRONMENT_CLASS_RANGES = {
+    0: "< 35 dBA",
+    1: "35-45 dBA",
+    2: "45-55 dBA",
+    3: "55-65 dBA",
+    4: "65-75 dBA",
+    5: "75-85 dBA",
+    6: ">= 85 dBA",
+}
+
+AUDIO_ENVIRONMENT_CLASS_INTERVALS = {
+    0: "Estimated LAeq < 35 dBA",
+    1: "35 <= Estimated LAeq < 45 dBA",
+    2: "45 <= Estimated LAeq < 55 dBA",
+    3: "55 <= Estimated LAeq < 65 dBA",
+    4: "65 <= Estimated LAeq < 75 dBA",
+    5: "75 <= Estimated LAeq < 85 dBA",
+    6: "Estimated LAeq >= 85 dBA",
+}
+
+AUDIO_ENVIRONMENT_CLASS_TICK_LABELS = (
+    "0 — Very quiet",
+    "1 — Quiet",
+    "2 — Moderate",
+    "3 — Lively",
+    "4 — Noisy",
+    "5 — Very noisy",
+    "6 — High exposure",
+)
+
 AUDIO_FEATURE_COLUMNS = [
     "window_sequence", "window_start_ms", "sample_count", "mean_counts_rounded",
     "rms_z_centi_dbfs", "rms_z_dbfs", "rms_a_centi_dbfs", "rms_a_dbfs",
@@ -144,8 +185,31 @@ AUDIO_FEATURE_COLUMNS = [
     "flag_impulsive_event", "flag_reserved", "physical_page_index",
     "page_sequence", "page_timestamp_ms", "record_index_in_page",
     "record_payload_offset", "page_version", "page_header_size",
-    "page_payload_bytes",
+    "page_payload_bytes", "boot_session", "session_elapsed_s",
+    "observed_elapsed_s", "record_valid", "environment_class_name",
+    "environment_class_range", "python_environment_class",
+    "environment_class_match",
 ]
+
+AUDIO_FEATURE_METRIC_FIELDS = (
+    ("mean_counts_rounded", "Mean microphone value", "counts"),
+    ("rms_z_dbfs", "RMS Z", "dBFS"),
+    ("rms_a_dbfs", "RMS A-weighted", "dBFS"),
+    ("estimated_laeq_dba", "Estimated LAeq", "dBA"),
+    ("peak_dbfs", "Peak", "dBFS"),
+    ("clipped_sample_count", "Clipped samples per window", "samples"),
+)
+
+AUDIO_FEATURE_FLAG_FIELDS = (
+    ("flag_complete", "Complete"),
+    ("flag_acquisition_valid", "Acquisition valid"),
+    ("flag_a_weighted_valid", "A-weighting valid"),
+    ("flag_clipped", "Clipped"),
+    ("flag_high_level", "High level"),
+    ("flag_silent_or_unavailable", "Silent/unavailable"),
+    ("flag_impulsive_event", "Impulsive event"),
+    ("flag_reserved", "Reserved"),
+)
 
 AUDIO_WINDOW_COLUMNS = [
     "audio_window_index", "audio_bytes", "audio_samples", "complete",
@@ -177,7 +241,8 @@ LIGHT_FEATURE_COLUMNS = [
     "flag_reserved_6", "flag_reserved_7",
     "expected_saturated", "saturation_match",
     "python_previous_exposure_class", "python_exposure_class",
-    "classification_match", "python_flags_reconstructible",
+    "classification_evaluated", "classification_match", "classification_reason",
+    "python_flags_reconstructible",
     "flags_reconstructible_match", "reserved_flags_valid", "record_valid",
     "overall_match", "physical_page_index", "page_sequence",
     "page_timestamp_ms", "record_index_in_page", "record_payload_offset",
@@ -564,6 +629,11 @@ def parse_light_feature_record(record: bytes) -> dict:
     }
 
 
+def light_hysteresis_return_threshold(threshold: int) -> int:
+    return_margin = max(1, (threshold * 5 + 99) // 100)
+    return threshold - return_margin
+
+
 def classify_light_with_hysteresis(
     clear_counts: int,
     previous_class: int | None,
@@ -588,8 +658,7 @@ def classify_light_with_hysteresis(
 
         while classification > 0:
             threshold = LIGHT_FEATURE_BOUNDARY_THRESHOLDS[classification - 1]
-            return_margin = max(1, (threshold * 5 + 99) // 100)
-            return_threshold = threshold - return_margin
+            return_threshold = light_hysteresis_return_threshold(threshold)
             if clear_counts >= return_threshold:
                 break
             classification -= 1
@@ -597,6 +666,18 @@ def classify_light_with_hysteresis(
     if clear_counts >= LIGHT_SATURATION_CLEAR_COUNTS:
         classification = 4
 
+    return classification
+
+
+def classify_light_without_history(clear_counts: int) -> int | None:
+    """Return a class only when Clear determines it without prior state."""
+    classification = classify_light_with_hysteresis(clear_counts, None)
+    if classification >= 4:
+        return classification
+
+    next_threshold = LIGHT_FEATURE_BOUNDARY_THRESHOLDS[classification]
+    if clear_counts >= light_hysteresis_return_threshold(next_threshold):
+        return None
     return classification
 
 
@@ -2103,11 +2184,14 @@ def analyze_and_export_audio(
 ) -> AudioMetrics | None:
     """Decode raw audio once, export WAVs, plots, metrics and summary section."""
     if not audio_bytes:
-        message = "No audio data available; skipping audio WAV amplification, plots and metrics."
+        message = (
+            "No AUD0 raw audio available; skipping WAV and raw audio waveform/"
+            "spectral plots."
+        )
         print(message)
         with summary_filename.open("a", encoding="utf-8") as summary_file:
             summary_file.write("\nAudio metrics summary\n")
-            summary_file.write("Audio analysis skipped: no audio data available.\n")
+            summary_file.write("AUD0 raw audio analysis skipped: no AUD0 data available.\n")
         return None
 
     output_prefix = _audio_output_prefix_from_wav(original_wav_filename)
@@ -2275,6 +2359,37 @@ class ParseStats:
     suspicious_timestamp_records: int = 0
     values_equal_65535: int = 0
     plots_skipped: int = 0
+
+
+@dataclass
+class BleInputStats:
+    logical_pages: int = 0
+    first_page_sequence: int | None = None
+    last_page_sequence: int | None = None
+    first_physical_page_index: int | None = None
+    last_physical_page_index: int | None = None
+    crc_mismatches: int = 0
+    metadata_mismatches: int = 0
+
+
+@dataclass
+class VirtualNandPage:
+    data: bytes
+    physical_page_index: int
+
+
+BLE_PAGE_CSV_COLUMNS = (
+    "page_sequence",
+    "physical_page_index",
+    "log_generation",
+    "magic",
+    "page_version",
+    "page_header_size",
+    "page_payload_bytes",
+    "logical_page_bytes",
+    "page_crc32",
+    "file_offset",
+)
 
 
 def parse_sensor_record(record: bytes) -> dict:
@@ -3751,6 +3866,503 @@ def assign_light_boot_sessions(
     return result, timestamp_resets, unexpected_regressions
 
 
+def analyze_audio_feature_dataframe(
+    audio_feature_df: pd.DataFrame,
+    parser_invalid_records: int = 0,
+) -> tuple[pd.DataFrame, dict]:
+    """Add session metadata and compute AFEA-only descriptive metrics."""
+    result = audio_feature_df.copy()
+    if result.empty:
+        result["boot_session"] = pd.Series(dtype="int64")
+        result["session_elapsed_s"] = pd.Series(dtype="float64")
+        result["observed_elapsed_s"] = pd.Series(dtype="float64")
+        result["record_valid"] = pd.Series(dtype="bool")
+        result["environment_class_name"] = pd.Series(dtype="object")
+        result["environment_class_range"] = pd.Series(dtype="object")
+        result["python_environment_class"] = pd.Series(dtype="Int64")
+        result["environment_class_match"] = pd.Series(dtype="boolean")
+        return result, {
+            "total_records": int(parser_invalid_records),
+            "decoded_records": 0,
+            "valid_records": 0,
+            "invalid_records": int(parser_invalid_records),
+            "valid_percentage": 0.0,
+            "first_window_sequence": None,
+            "last_window_sequence": None,
+            "first_timestamp_ms": None,
+            "last_timestamp_ms": None,
+            "detected_boot_sessions": 0,
+            "records_per_boot_session": {},
+            "session_durations_s": {},
+            "total_observed_duration_s": 0.0,
+            "global_timestamp_regressions": 0,
+            "recognized_timestamp_resets": 0,
+            "unexpected_timestamp_regressions": 0,
+            "non_monotonic_timestamps_within_sessions": 0,
+            "clipping_event_records": 0,
+            "clipped_sample_total": 0,
+            "flag_counts": {column: 0 for column, _label in AUDIO_FEATURE_FLAG_FIELDS},
+            "feature_stats": {},
+            "environment_class_distribution": [
+                {
+                    "code": code,
+                    "name": AUDIO_ENVIRONMENT_CLASS_NAMES[code],
+                    "range": AUDIO_ENVIRONMENT_CLASS_RANGES[code],
+                    "count": 0,
+                    "percentage": 0.0,
+                }
+                for code in range(7)
+            ],
+            "unknown_environment_class_records": 0,
+            "environment_class_evaluated": 0,
+            "environment_class_matches": 0,
+            "environment_class_mismatches": 0,
+            "environment_class_not_evaluated": 0,
+            "warnings": [],
+        }
+
+    session_source = result[["window_sequence", "window_start_ms"]].rename(
+        columns={"window_start_ms": "sample_timestamp_ms"}
+    )
+    (
+        session_source,
+        recognized_timestamp_resets,
+        unexpected_timestamp_regressions,
+    ) = assign_light_boot_sessions(session_source)
+    result["boot_session"] = session_source["boot_session"].to_numpy(dtype=np.int64)
+    result["session_elapsed_s"] = np.nan
+    result["observed_elapsed_s"] = np.nan
+
+    session_durations_s = {}
+    records_per_boot_session = {}
+    non_monotonic_within_sessions = 0
+    for session, indexes in result.groupby("boot_session", sort=True).groups.items():
+        session_timestamps = pd.to_numeric(
+            result.loc[indexes, "window_start_ms"], errors="coerce"
+        )
+        finite_timestamps = session_timestamps[np.isfinite(session_timestamps)]
+        records_per_boot_session[int(session)] = int(len(indexes))
+        if finite_timestamps.empty:
+            session_durations_s[int(session)] = None
+            continue
+        first_timestamp = float(finite_timestamps.iloc[0])
+        result.loc[indexes, "session_elapsed_s"] = (
+            session_timestamps - first_timestamp
+        ) / 1000.0
+        session_durations_s[int(session)] = float(
+            (finite_timestamps.iloc[-1] - finite_timestamps.iloc[0]) / 1000.0
+        )
+        non_monotonic_within_sessions += int(
+            (finite_timestamps.diff().dropna() < 0).sum()
+        )
+
+    positive_steps_s = []
+    for _session, session_df in result.groupby("boot_session", sort=True):
+        steps = pd.to_numeric(
+            session_df["session_elapsed_s"], errors="coerce"
+        ).diff().to_numpy(float)
+        positive_steps_s.extend(steps[np.isfinite(steps) & (steps > 0)].tolist())
+    session_gap_s = float(np.median(positive_steps_s)) if positive_steps_s else 1.0
+    observed_offset_s = 0.0
+    for _session, indexes in result.groupby("boot_session", sort=True).groups.items():
+        elapsed = pd.to_numeric(result.loc[indexes, "session_elapsed_s"], errors="coerce")
+        result.loc[indexes, "observed_elapsed_s"] = elapsed + observed_offset_s
+        finite_elapsed = elapsed[np.isfinite(elapsed)]
+        if not finite_elapsed.empty:
+            observed_offset_s += float(finite_elapsed.max()) + session_gap_s
+
+    sample_count = pd.to_numeric(result["sample_count"], errors="coerce")
+    record_valid = (
+        result["flag_complete"].astype(bool)
+        & result["flag_acquisition_valid"].astype(bool)
+        & sample_count.gt(0)
+    )
+    result["record_valid"] = record_valid.astype(bool)
+    decoded_records = int(len(result))
+    valid_records = int(record_valid.sum())
+    semantic_invalid_records = decoded_records - valid_records
+    invalid_records = semantic_invalid_records + int(parser_invalid_records)
+    total_records = valid_records + invalid_records
+
+    analysis_warnings = []
+    environment_codes = pd.to_numeric(result["environment_class"], errors="coerce")
+    environment_class_names = []
+    environment_class_ranges = []
+    unknown_environment_values = set()
+    for raw_value, numeric_value in zip(result["environment_class"], environment_codes):
+        if np.isfinite(numeric_value) and float(numeric_value).is_integer():
+            code = int(numeric_value)
+            if code in AUDIO_ENVIRONMENT_CLASS_NAMES:
+                environment_class_names.append(AUDIO_ENVIRONMENT_CLASS_NAMES[code])
+                environment_class_ranges.append(AUDIO_ENVIRONMENT_CLASS_RANGES[code])
+                continue
+            unknown_text = str(code)
+        else:
+            unknown_text = str(raw_value)
+        environment_class_names.append(f"UNKNOWN_CLASS_{unknown_text}")
+        environment_class_ranges.append("UNKNOWN")
+        unknown_environment_values.add(unknown_text)
+
+    result["environment_class_name"] = environment_class_names
+    result["environment_class_range"] = environment_class_ranges
+    for unknown_value in sorted(unknown_environment_values):
+        analysis_warnings.append(
+            f"Unknown AFEA environment_class={unknown_value}; "
+            f"using UNKNOWN_CLASS_{unknown_value}"
+        )
+
+    estimated_laeq = pd.to_numeric(result["estimated_laeq_dba"], errors="coerce")
+    python_environment_classes = [
+        classify_embedded_audio_environment(value) for value in estimated_laeq
+    ]
+    result["python_environment_class"] = pd.array(
+        python_environment_classes, dtype="Int64"
+    )
+    environment_class_evaluated_mask = (
+        environment_codes.isin(range(7)) & np.isfinite(estimated_laeq)
+    )
+    environment_class_match = pd.Series(
+        pd.NA, index=result.index, dtype="boolean"
+    )
+    environment_class_match.loc[environment_class_evaluated_mask] = (
+        environment_codes.loc[environment_class_evaluated_mask].astype(int).to_numpy()
+        == result.loc[
+            environment_class_evaluated_mask, "python_environment_class"
+        ].astype(int).to_numpy()
+    )
+    result["environment_class_match"] = environment_class_match
+    mismatch_mask = environment_class_evaluated_mask & ~environment_class_match.fillna(False)
+    for row in result.loc[mismatch_mask].itertuples(index=False):
+        analysis_warnings.append(
+            f"AFEA window_sequence={int(row.window_sequence)} environment mismatch: "
+            f"firmware={int(row.environment_class)}, "
+            f"Python={int(row.python_environment_class)}, "
+            f"Estimated LAeq={float(row.estimated_laeq_dba):.3f} dBA"
+        )
+
+    environment_class_distribution = []
+    for code in range(7):
+        count = int((environment_codes == code).sum())
+        environment_class_distribution.append(
+            {
+                "code": code,
+                "name": AUDIO_ENVIRONMENT_CLASS_NAMES[code],
+                "range": AUDIO_ENVIRONMENT_CLASS_RANGES[code],
+                "count": count,
+                "percentage": (100.0 * count / decoded_records) if decoded_records else 0.0,
+            }
+        )
+    known_environment_records = sum(
+        item["count"] for item in environment_class_distribution
+    )
+
+    feature_stats = {}
+    for column, label, unit in AUDIO_FEATURE_METRIC_FIELDS:
+        if column not in result.columns:
+            continue
+        values = pd.to_numeric(result.loc[record_valid, column], errors="coerce")
+        finite = values[np.isfinite(values)].to_numpy(dtype=float)
+        feature_stats[column] = {
+            "label": label,
+            "unit": unit,
+            "finite_count": int(finite.size),
+            "min": float(np.min(finite)) if finite.size else None,
+            "max": float(np.max(finite)) if finite.size else None,
+            "mean": float(np.mean(finite)) if finite.size else None,
+            "median": float(np.median(finite)) if finite.size else None,
+        }
+
+    flag_counts = {
+        column: int(result[column].astype(bool).sum())
+        for column, _label in AUDIO_FEATURE_FLAG_FIELDS
+        if column in result.columns
+    }
+    clipped_counts = pd.to_numeric(
+        result["clipped_sample_count"], errors="coerce"
+    ).fillna(0)
+    clipping_events = result["flag_clipped"].astype(bool) | clipped_counts.gt(0)
+    timestamp_values = pd.to_numeric(result["window_start_ms"], errors="coerce")
+    total_observed_duration_s = float(sum(
+        duration for duration in session_durations_s.values()
+        if duration is not None and np.isfinite(duration) and duration >= 0
+    ))
+
+    summary = {
+        "total_records": total_records,
+        "decoded_records": decoded_records,
+        "valid_records": valid_records,
+        "invalid_records": invalid_records,
+        "valid_percentage": (100.0 * valid_records / total_records) if total_records else 0.0,
+        "first_window_sequence": int(result["window_sequence"].iloc[0]),
+        "last_window_sequence": int(result["window_sequence"].iloc[-1]),
+        "first_timestamp_ms": int(result["window_start_ms"].iloc[0]),
+        "last_timestamp_ms": int(result["window_start_ms"].iloc[-1]),
+        "detected_boot_sessions": int(result["boot_session"].nunique()),
+        "records_per_boot_session": records_per_boot_session,
+        "session_durations_s": session_durations_s,
+        "total_observed_duration_s": total_observed_duration_s,
+        "global_timestamp_regressions": int((timestamp_values.diff().dropna() < 0).sum()),
+        "recognized_timestamp_resets": int(recognized_timestamp_resets),
+        "unexpected_timestamp_regressions": int(unexpected_timestamp_regressions),
+        "non_monotonic_timestamps_within_sessions": non_monotonic_within_sessions,
+        "clipping_event_records": int(clipping_events.sum()),
+        "clipped_sample_total": int(clipped_counts.sum()),
+        "flag_counts": flag_counts,
+        "feature_stats": feature_stats,
+        "environment_class_distribution": environment_class_distribution,
+        "unknown_environment_class_records": decoded_records - known_environment_records,
+        "environment_class_evaluated": int(environment_class_evaluated_mask.sum()),
+        "environment_class_matches": int(
+            (environment_class_evaluated_mask & environment_class_match.fillna(False)).sum()
+        ),
+        "environment_class_mismatches": int(mismatch_mask.sum()),
+        "environment_class_not_evaluated": int(
+            decoded_records - environment_class_evaluated_mask.sum()
+        ),
+        "warnings": analysis_warnings,
+    }
+    return result, summary
+
+
+def _format_audio_feature_summary_lines(summary: dict) -> list[str]:
+    lines = [
+        f"AFEA decoded records: {summary['decoded_records']}",
+        f"AFEA valid records: {summary['valid_records']}",
+        f"AFEA invalid records: {summary['invalid_records']}",
+        f"AFEA valid percentage: {summary['valid_percentage']:.3f}%",
+        f"AFEA first window_sequence: {summary['first_window_sequence']}",
+        f"AFEA last window_sequence: {summary['last_window_sequence']}",
+        f"AFEA first timestamp: {summary['first_timestamp_ms']} ms",
+        f"AFEA last timestamp: {summary['last_timestamp_ms']} ms",
+        f"AFEA boot sessions: {summary['detected_boot_sessions']}",
+        f"AFEA records per boot session: {summary['records_per_boot_session']}",
+        f"AFEA session durations: {summary['session_durations_s']} s",
+        f"AFEA total observed duration: {summary['total_observed_duration_s']:.3f} s",
+        f"AFEA global timestamp regressions: {summary['global_timestamp_regressions']}",
+        f"AFEA recognized timestamp resets: {summary['recognized_timestamp_resets']}",
+        "AFEA non-monotonic timestamps within sessions: "
+        f"{summary['non_monotonic_timestamps_within_sessions']}",
+        f"AFEA clipping event records: {summary['clipping_event_records']}",
+        f"AFEA clipped sample total: {summary['clipped_sample_total']}",
+        f"AFEA environment classes evaluated: {summary['environment_class_evaluated']}",
+        f"AFEA environment class matches: {summary['environment_class_matches']}",
+        f"AFEA environment class mismatches: {summary['environment_class_mismatches']}",
+        "AFEA environment classes not evaluated: "
+        f"{summary['environment_class_not_evaluated']}",
+        f"AFEA unknown environment class records: {summary['unknown_environment_class_records']}",
+    ]
+    for column, stats in summary["feature_stats"].items():
+        unit = stats["unit"]
+        values = (
+            f"min={_format_number(stats['min'])}, max={_format_number(stats['max'])}, "
+            f"mean={_format_number(stats['mean'])}, "
+            f"median={_format_number(stats['median'])} {unit}"
+        )
+        lines.append(
+            f"AFEA {stats['label']} ({column}, {stats['finite_count']} finite): {values}"
+        )
+    lines.extend(["", "Audio environment class distribution"])
+    for item in summary["environment_class_distribution"]:
+        lines.append(
+            f"  {item['code']} | {item['name']} | {item['range']} | "
+            f"count={item['count']} | {item['percentage']:.3f}%"
+        )
+    return lines
+
+
+def write_audio_feature_summary_report(report_filename: Path, summary: dict) -> None:
+    lines = [
+        "Audio feature summary (AFEA)",
+        "RMS Z, RMS A-weighted and peak are firmware-provided dBFS values.",
+        "Estimated LAeq is firmware-provided dBA; it is not labelled as calibrated dB SPL.",
+        "Boot sessions use increasing window_sequence plus window_start_ms resets.",
+        "session_elapsed_s resets at each boot; observed_elapsed_s concatenates sessions only for plots.",
+        "",
+    ]
+    lines.extend(_format_audio_feature_summary_lines(summary))
+    lines.extend(["", "Official audio environment class legend:"])
+    for code in range(7):
+        lines.append(
+            f"  {code} = {AUDIO_ENVIRONMENT_CLASS_NAMES[code]} | "
+            f"{AUDIO_ENVIRONMENT_CLASS_INTERVALS[code]}"
+        )
+    lines.extend(["", "AFEA flag counts:"])
+    for column, label in AUDIO_FEATURE_FLAG_FIELDS:
+        lines.append(f"  {label} ({column}): {summary['flag_counts'].get(column, 0)}")
+    if summary["warnings"]:
+        lines.extend(["", "Warnings:"])
+        lines.extend(f"  {warning}" for warning in summary["warnings"])
+    report_filename.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _plot_audio_feature_series(
+    ax,
+    audio_feature_df: pd.DataFrame,
+    column: str,
+    label: str,
+    color: str,
+    drawstyle: str = "default",
+) -> bool:
+    if column not in audio_feature_df.columns:
+        ax.text(0.5, 0.5, f"{label} unavailable", ha="center", va="center", transform=ax.transAxes)
+        return False
+    plotted = False
+    for _session, session_df in audio_feature_df.groupby("boot_session", sort=True):
+        x = pd.to_numeric(session_df["observed_elapsed_s"], errors="coerce").to_numpy(float)
+        y = pd.to_numeric(session_df[column], errors="coerce").to_numpy(float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not finite.any():
+            continue
+        linestyle = "-" if int(finite.sum()) > 1 else "None"
+        ax.plot(
+            x[finite], y[finite], color=color, marker="o", markersize=3,
+            linewidth=1.2, linestyle=linestyle, drawstyle=drawstyle,
+            label=label if not plotted else "_nolegend_",
+        )
+        plotted = True
+    if not plotted:
+        ax.text(0.5, 0.5, f"No finite {label} values", ha="center", va="center", transform=ax.transAxes)
+    return plotted
+
+
+def _mark_audio_feature_sessions(ax, audio_feature_df: pd.DataFrame) -> None:
+    first_times = audio_feature_df.groupby("boot_session", sort=True)["observed_elapsed_s"].first()
+    for elapsed_s in first_times.iloc[1:]:
+        ax.axvline(float(elapsed_s), color="#777777", linestyle=":", linewidth=0.9, alpha=0.7)
+
+
+def plot_audio_feature_records(
+    audio_feature_df: pd.DataFrame,
+    output_prefix: Path,
+) -> list[Path]:
+    if audio_feature_df.empty:
+        print("No AFEA records available; skipping audio feature plots.")
+        return []
+
+    print(f"AFEA records available: {len(audio_feature_df)}. Generating audio feature plots.")
+    output_files = []
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True, constrained_layout=True)
+    timeline_fields = (
+        ("mean_counts_rounded", "Mean microphone value [counts]", "#4C78A8", "default"),
+        ("sample_count", "Samples per window [samples]", "#59A14F", "default"),
+        ("environment_class", "Environment class [category]", "#F28E2B", "steps-mid"),
+    )
+    for ax, (column, label, color, drawstyle) in zip(axes, timeline_fields):
+        _plot_audio_feature_series(ax, audio_feature_df, column, label, color, drawstyle)
+        _mark_audio_feature_sessions(ax, audio_feature_df)
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.3)
+        if ax.lines:
+            ax.legend(fontsize=8)
+    environment_axis = axes[2]
+    environment_axis.set_yticks(range(7))
+    environment_axis.set_yticklabels(AUDIO_ENVIRONMENT_CLASS_TICK_LABELS)
+    environment_axis.set_ylim(-0.5, 6.5)
+    axes[-1].set_xlabel("Observed time [s] (boot sessions concatenated; dotted lines = resets)")
+    axes[0].set_title("AFEA audio features over time")
+    timeseries_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_timeseries.png"
+    )
+    fig.savefig(timeseries_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    output_files.append(timeseries_filename)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
+    for column, label, color in (
+        ("rms_z_dbfs", "RMS Z [dBFS]", "#4C78A8"),
+        ("rms_a_dbfs", "RMS A-weighted [dBFS]", "#59A14F"),
+        ("peak_dbfs", "Peak [dBFS]", "#E15759"),
+    ):
+        _plot_audio_feature_series(axes[0], audio_feature_df, column, label, color)
+    _plot_audio_feature_series(
+        axes[1], audio_feature_df, "estimated_laeq_dba", "Estimated LAeq [dBA]", "#B07AA1"
+    )
+    for ax in axes:
+        _mark_audio_feature_sessions(ax, audio_feature_df)
+        ax.grid(True, alpha=0.3)
+        if ax.lines:
+            ax.legend(fontsize=8)
+    axes[0].set_ylabel("Digital level [dBFS]")
+    axes[1].set_ylabel("Estimated level [dBA]")
+    axes[1].set_xlabel("Observed time [s] (boot sessions concatenated; dotted lines = resets)")
+    axes[0].set_title("AFEA levels per window")
+    levels_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_levels.png"
+    )
+    fig.savefig(levels_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    output_files.append(levels_filename)
+
+    fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
+    x = pd.to_numeric(audio_feature_df["observed_elapsed_s"], errors="coerce").to_numpy(float)
+    flag_columns = [column for column, _label in AUDIO_FEATURE_FLAG_FIELDS if column in audio_feature_df]
+    flag_labels = [label for column, label in AUDIO_FEATURE_FLAG_FIELDS if column in audio_feature_df]
+    for lane, column in enumerate(flag_columns):
+        values = audio_feature_df[column].astype(bool).to_numpy()
+        colors = np.where(values, "#D62728", "#D9D9D9")
+        ax.scatter(x, np.full(len(x), lane), c=colors, marker="s", s=28)
+    ax.set_yticks(range(len(flag_labels)))
+    ax.set_yticklabels(flag_labels)
+    ax.set_xlabel("Observed time [s] (boot sessions concatenated)")
+    ax.grid(True, axis="x", alpha=0.3)
+    event_columns = [
+        "flag_clipped", "flag_high_level", "flag_silent_or_unavailable",
+        "flag_impulsive_event", "flag_reserved",
+    ]
+    no_quality_events = not any(
+        audio_feature_df[column].astype(bool).any()
+        for column in event_columns if column in audio_feature_df
+    )
+    quality_title = "AFEA validity, quality and event flags (red = active, grey = inactive)"
+    if no_quality_events:
+        quality_title += "\nNo clipping/high-level/silent/impulsive/reserved events detected"
+    ax.set_title(quality_title)
+    quality_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_quality.png"
+    )
+    fig.savefig(quality_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    output_files.append(quality_filename)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
+    for column, label, color in (
+        ("rms_z_dbfs", "RMS Z [dBFS]", "#4C78A8"),
+        ("rms_a_dbfs", "RMS A-weighted [dBFS]", "#59A14F"),
+        ("peak_dbfs", "Peak [dBFS]", "#E15759"),
+    ):
+        values = pd.to_numeric(audio_feature_df[column], errors="coerce").to_numpy(float)
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            axes[0].hist(finite, bins=max(1, min(20, int(np.sqrt(finite.size)))), alpha=0.45, label=label, color=color)
+    laeq = pd.to_numeric(audio_feature_df["estimated_laeq_dba"], errors="coerce").to_numpy(float)
+    finite_laeq = laeq[np.isfinite(laeq)]
+    if finite_laeq.size:
+        axes[1].hist(finite_laeq, bins=max(1, min(20, int(np.sqrt(finite_laeq.size)))), color="#B07AA1", alpha=0.75)
+    else:
+        axes[1].text(0.5, 0.5, "No finite estimated LAeq values", ha="center", va="center", transform=axes[1].transAxes)
+    axes[0].set_xlabel("Digital level [dBFS]")
+    axes[0].set_ylabel("Windows")
+    axes[1].set_xlabel("Estimated LAeq [dBA]")
+    axes[1].set_ylabel("Windows")
+    axes[0].set_title("AFEA digital-level distributions")
+    axes[1].set_title("AFEA estimated LAeq distribution")
+    for ax in axes:
+        ax.grid(True, axis="y", alpha=0.3)
+    if axes[0].patches:
+        axes[0].legend(fontsize=8)
+    distribution_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_distribution.png"
+    )
+    fig.savefig(distribution_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    output_files.append(distribution_filename)
+
+    for output_file in output_files:
+        print(f"Audio feature plot saved to: {output_file}")
+    return output_files
+
+
 def validate_light_feature_records(
     light_feature_rows: list[dict],
     stats: ParseStats,
@@ -3758,6 +4370,7 @@ def validate_light_feature_records(
     rows = []
     warnings = []
     previous_python_class = None
+    previous_boot_session = None
 
     sequences = [int(row["window_sequence"]) for row in light_feature_rows]
     timestamps = [int(row["sample_timestamp_ms"]) for row in light_feature_rows]
@@ -3772,8 +4385,20 @@ def validate_light_feature_records(
     duplicate_sequences = sorted(
         sequence for sequence in set(sequences) if sequences.count(sequence) > 1
     )
-    for source in light_feature_rows:
+    source_df = pd.DataFrame(light_feature_rows)
+    (
+        source_df,
+        recognized_timestamp_resets,
+        unexpected_timestamp_regressions,
+    ) = assign_light_boot_sessions(source_df)
+
+    for source in source_df.to_dict("records"):
         row = dict(source)
+        boot_session = int(row["boot_session"])
+        if previous_boot_session is None or boot_session != previous_boot_session:
+            previous_python_class = None
+        previous_boot_session = boot_session
+
         exposure_class = int(row["exposure_class"])
         flags = int(row["flags"])
         complete = bool(row["flag_complete"])
@@ -3794,10 +4419,20 @@ def validate_light_feature_records(
         python_previous_class = previous_python_class
 
         if record_valid:
-            python_class = classify_light_with_hysteresis(
-                int(row["clear"]), previous_python_class
+            if previous_python_class is None:
+                python_class = classify_light_without_history(int(row["clear"]))
+            else:
+                python_class = classify_light_with_hysteresis(
+                    int(row["clear"]), previous_python_class
+                )
+            classification_evaluated = python_class is not None
+            classification_match = (
+                exposure_class == python_class if classification_evaluated else None
             )
-            classification_match = exposure_class == python_class
+            classification_reason = (
+                "" if classification_evaluated
+                else "initial hysteresis state unknown"
+            )
             saturation_match = (
                 bool(row["flag_saturated"]) == expected_saturated
                 and (not bool(row["flag_saturated"]) or exposure_class == 4)
@@ -3808,10 +4443,13 @@ def validate_light_feature_records(
                 | LIGHT_FLAG_CLASSIFICATION_VALID
                 | (LIGHT_FLAG_SATURATED if expected_saturated else 0)
             )
-            previous_python_class = python_class
+            if classification_evaluated:
+                previous_python_class = python_class
         else:
             python_class = LIGHT_EXPOSURE_UNAVAILABLE
+            classification_evaluated = False
             classification_match = class_flag_consistent
+            classification_reason = "record not valid"
             saturation_match = not bool(row["flag_saturated"])
             python_flags = 0
 
@@ -3825,11 +4463,14 @@ def validate_light_feature_records(
             record_valid
             and (bool(row["flag_i2c_error"]) or bool(row["flag_smux_error"]))
         )
+        classification_acceptable = (
+            not classification_evaluated or bool(classification_match)
+        )
         overall_match = all(
             (
                 record_valid,
                 class_flag_consistent,
-                classification_match,
+                classification_acceptable,
                 saturation_match,
                 flags_reconstructible_match,
                 reserved_flags_valid,
@@ -3843,7 +4484,9 @@ def validate_light_feature_records(
                 "saturation_match": saturation_match,
                 "python_previous_exposure_class": python_previous_class,
                 "python_exposure_class": python_class,
+                "classification_evaluated": classification_evaluated,
                 "classification_match": classification_match,
+                "classification_reason": classification_reason,
                 "python_flags_reconstructible": python_flags,
                 "flags_reconstructible_match": flags_reconstructible_match,
                 "reserved_flags_valid": reserved_flags_valid,
@@ -3864,7 +4507,12 @@ def validate_light_feature_records(
             warnings.append(
                 f"Sequence {sequence}: valid record carries I2C_ERROR or SMUX_ERROR"
             )
-        if record_valid and not classification_match:
+        if record_valid and not classification_evaluated:
+            warnings.append(
+                f"Sequence {sequence}: classification not evaluated "
+                "(initial hysteresis state unknown)"
+            )
+        elif record_valid and not classification_match:
             warnings.append(f"Sequence {sequence}: exposure classification mismatch")
         if record_valid and not saturation_match:
             warnings.append(f"Sequence {sequence}: saturation mismatch")
@@ -3872,11 +4520,16 @@ def validate_light_feature_records(
             warnings.append(f"Sequence {sequence}: reconstructible flag mismatch")
 
     light_feature_df = pd.DataFrame(rows, columns=LIGHT_FEATURE_COLUMNS)
-    (
-        light_feature_df,
-        recognized_timestamp_resets,
-        unexpected_timestamp_regressions,
-    ) = assign_light_boot_sessions(light_feature_df)
+    if not light_feature_df.empty:
+        light_feature_df["python_previous_exposure_class"] = pd.array(
+            light_feature_df["python_previous_exposure_class"], dtype="Int64"
+        )
+        light_feature_df["python_exposure_class"] = pd.array(
+            light_feature_df["python_exposure_class"], dtype="Int64"
+        )
+        light_feature_df["classification_match"] = pd.array(
+            light_feature_df["classification_match"], dtype="boolean"
+        )
     global_timestamp_regressions = int(
         (
             light_feature_df["sample_timestamp_ms"].diff().dropna() < 0
@@ -3911,11 +4564,23 @@ def validate_light_feature_records(
     stats.invalid_light_feature_records += semantic_invalid_records
 
     valid_records = int(valid_mask.sum()) if not valid_mask.empty else 0
+    classification_evaluated_mask = (
+        valid_mask & light_feature_df["classification_evaluated"].astype(bool)
+        if not light_feature_df.empty else pd.Series(dtype=bool)
+    )
+    classification_match_mask = (
+        light_feature_df["classification_match"].fillna(False).astype(bool)
+        if not light_feature_df.empty else pd.Series(dtype=bool)
+    )
+    classification_evaluated = int(classification_evaluated_mask.sum())
     classification_matches = int(
-        (valid_mask & light_feature_df["classification_match"].astype(bool)).sum()
+        (classification_evaluated_mask & classification_match_mask).sum()
     ) if not light_feature_df.empty else 0
     classification_mismatches = int(
-        (valid_mask & ~light_feature_df["classification_match"].astype(bool)).sum()
+        (classification_evaluated_mask & ~classification_match_mask).sum()
+    ) if not light_feature_df.empty else 0
+    classification_not_evaluated = int(
+        (valid_mask & ~light_feature_df["classification_evaluated"].astype(bool)).sum()
     ) if not light_feature_df.empty else 0
     saturation_matches = int(
         (valid_mask & light_feature_df["saturation_match"].astype(bool)).sum()
@@ -3947,6 +4612,8 @@ def validate_light_feature_records(
         final_result = "NOT AVAILABLE"
     elif structural_failures or row_failures:
         final_result = "FAIL"
+    elif valid_records and classification_evaluated == 0:
+        final_result = "NOT AVAILABLE"
     else:
         final_result = "PASS"
 
@@ -3973,8 +4640,10 @@ def validate_light_feature_records(
         "smux_error_records": int(light_feature_df["flag_smux_error"].sum())
             if not light_feature_df.empty else 0,
         "reserved_flag_violations": reserved_violations,
+        "classification_evaluated": classification_evaluated,
         "classification_matches": classification_matches,
         "classification_mismatches": classification_mismatches,
+        "classification_not_evaluated": classification_not_evaluated,
         "saturation_matches": saturation_matches,
         "saturation_mismatches": saturation_mismatches,
         "flag_mismatches": flag_mismatches,
@@ -4101,8 +4770,11 @@ def write_light_feature_validation_report(
         f"I2C error records: {validation_summary['i2c_error_records']}",
         f"SMUX error records: {validation_summary['smux_error_records']}",
         f"Reserved flag violations: {validation_summary['reserved_flag_violations']}",
+        f"Classification evaluated: {validation_summary['classification_evaluated']}",
         f"Classification matches: {validation_summary['classification_matches']}",
         f"Classification mismatches: {validation_summary['classification_mismatches']}",
+        "Classification not evaluated: "
+        f"{validation_summary['classification_not_evaluated']}",
         f"Saturation matches: {validation_summary['saturation_matches']}",
         f"Saturation mismatches: {validation_summary['saturation_mismatches']}",
         f"Flag mismatches: {validation_summary['flag_mismatches']}",
@@ -4119,16 +4791,32 @@ def write_light_feature_validation_report(
         lines.append("")
 
     for row in light_feature_df.to_dict("records"):
+        classification_evaluated = bool(row["classification_evaluated"])
+        python_class = (
+            "N/A" if pd.isna(row["python_exposure_class"])
+            else int(row["python_exposure_class"])
+        )
+        classification_match = (
+            str(bool(row["classification_match"]))
+            if classification_evaluated else "NOT EVALUATED"
+        )
+        record_result = (
+            "NOT EVALUATED"
+            if bool(row["record_valid"]) and not classification_evaluated
+            else ("PASS" if row["overall_match"] else "FAIL")
+        )
         lines.extend(
             [
                 f"Sequence {row['window_sequence']}:",
                 f"  Clear={row['clear']}",
                 f"  firmware_class={row['exposure_class']}",
-                f"  python_class={row['python_exposure_class']}",
+                f"  python_class={python_class}",
                 f"  flags={row['flags_hex']}",
-                f"  classification_match={row['classification_match']}",
+                f"  classification_evaluated={classification_evaluated}",
+                f"  classification_match={classification_match}",
+                f"  reason={row['classification_reason'] or 'N/A'}",
                 f"  saturation_match={row['saturation_match']}",
-                f"  {'PASS' if row['overall_match'] else 'FAIL'}",
+                f"  {record_result}",
             ]
         )
 
@@ -4145,6 +4833,193 @@ def _output_prefix_from_summary(summary_filename: Path) -> Path:
     return summary_filename.with_name(prefix_name)
 
 
+def _parse_ble_csv_int(row: dict, column: str, csv_line_number: int) -> int:
+    raw_value = str(row.get(column, "")).strip()
+    try:
+        if raw_value.lower().startswith(("0x", "+0x", "-0x")):
+            return int(raw_value, 16)
+        return int(raw_value, 10)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid BLE metadata value at CSV line {csv_line_number}: "
+            f"{column}={raw_value!r}"
+        ) from exc
+
+
+def load_ble_virtual_pages(
+    bin_filename: Path,
+    csv_filename: Path,
+) -> tuple[list[VirtualNandPage], BleInputStats]:
+    """Load BLE logical pages and pad them with 0xFF for the legacy parser.
+
+    Rows are parsed in ascending page_sequence order (file_offset breaks ties),
+    which preserves the logger's chronological order even if CSV rows are moved.
+    file_offset is always used for the actual binary read.
+    """
+    with csv_filename.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        missing_columns = [
+            column for column in BLE_PAGE_CSV_COLUMNS
+            if column not in (reader.fieldnames or [])
+        ]
+        if missing_columns:
+            raise ValueError(
+                "BLE pages CSV is missing required column(s): "
+                + ", ".join(missing_columns)
+            )
+
+        metadata_rows = []
+        for csv_line_number, row in enumerate(reader, start=2):
+            parsed = {
+                column: _parse_ble_csv_int(row, column, csv_line_number)
+                for column in BLE_PAGE_CSV_COLUMNS
+                if column != "magic"
+            }
+            parsed["magic"] = str(row.get("magic", "")).strip()
+            parsed["csv_line_number"] = csv_line_number
+            metadata_rows.append(parsed)
+
+    metadata_rows.sort(key=lambda row: (row["page_sequence"], row["file_offset"]))
+    stats = BleInputStats(logical_pages=len(metadata_rows))
+    virtual_pages = []
+
+    if metadata_rows:
+        stats.first_page_sequence = metadata_rows[0]["page_sequence"]
+        stats.last_page_sequence = metadata_rows[-1]["page_sequence"]
+        stats.first_physical_page_index = metadata_rows[0]["physical_page_index"]
+        stats.last_physical_page_index = metadata_rows[-1]["physical_page_index"]
+
+    def metadata_mismatch(page_sequence: int, message: str) -> None:
+        stats.metadata_mismatches += 1
+        print(f"Warning: BLE metadata mismatch for page_sequence={page_sequence}: {message}")
+
+    with bin_filename.open("rb") as bin_file:
+        for row in metadata_rows:
+            page_sequence = row["page_sequence"]
+            logical_page_bytes = row["logical_page_bytes"]
+            file_offset = row["file_offset"]
+
+            if file_offset < 0 or logical_page_bytes < 0:
+                raise ValueError(
+                    f"Invalid BLE file range for page_sequence={page_sequence}: "
+                    f"file_offset={file_offset}, logical_page_bytes={logical_page_bytes}"
+                )
+            if logical_page_bytes > PAGE_SIZE:
+                raise ValueError(
+                    f"BLE page_sequence={page_sequence} has logical_page_bytes="
+                    f"{logical_page_bytes}, larger than virtual page size {PAGE_SIZE}"
+                )
+
+            bin_file.seek(file_offset)
+            raw_logical_bytes = bin_file.read(logical_page_bytes)
+            if len(raw_logical_bytes) != logical_page_bytes:
+                raise ValueError(
+                    f"Short BLE page read for page_sequence={page_sequence} at "
+                    f"file_offset={file_offset}: expected {logical_page_bytes} byte(s), "
+                    f"got {len(raw_logical_bytes)}"
+                )
+
+            computed_crc32 = binascii.crc32(raw_logical_bytes) & 0xFFFFFFFF
+            expected_crc32 = row["page_crc32"] & 0xFFFFFFFF
+            if computed_crc32 != expected_crc32:
+                stats.crc_mismatches += 1
+                print(
+                    f"Warning: BLE CRC32 mismatch for page_sequence={page_sequence}: "
+                    f"computed=0x{computed_crc32:08X}, expected=0x{expected_crc32:08X}"
+                )
+
+            if logical_page_bytes < PAGE_HEADER_SIZE:
+                metadata_mismatch(
+                    page_sequence,
+                    f"logical page has only {logical_page_bytes} byte(s), fewer than "
+                    f"the {PAGE_HEADER_SIZE}-byte minimum header",
+                )
+            else:
+                (
+                    magic_word,
+                    actual_version,
+                    actual_header_size,
+                    actual_payload_bytes,
+                    actual_page_sequence,
+                    _page_timestamp_ms,
+                ) = struct.unpack_from(PAGE_HEADER_FORMAT, raw_logical_bytes, 0)
+                actual_magic = struct.pack("<I", magic_word)
+                expected_magic = row["magic"].encode("ascii", errors="replace")
+
+                if len(expected_magic) != 4 or actual_magic != expected_magic:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"header magic={actual_magic!r}, CSV magic={row['magic']!r}",
+                    )
+                if actual_page_sequence != page_sequence:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"header page_sequence={actual_page_sequence}, CSV={page_sequence}",
+                    )
+                if actual_version != row["page_version"]:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"header version={actual_version}, CSV={row['page_version']}",
+                    )
+                if actual_header_size != row["page_header_size"]:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"header size={actual_header_size}, CSV={row['page_header_size']}",
+                    )
+                if actual_payload_bytes != row["page_payload_bytes"]:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"header payload={actual_payload_bytes}, "
+                        f"CSV={row['page_payload_bytes']}",
+                    )
+                expected_logical_size = actual_header_size + actual_payload_bytes
+                if expected_logical_size != logical_page_bytes:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"header_size + payload_bytes={expected_logical_size}, "
+                        f"logical_page_bytes={logical_page_bytes}",
+                    )
+                csv_logical_size = row["page_header_size"] + row["page_payload_bytes"]
+                if csv_logical_size != logical_page_bytes:
+                    metadata_mismatch(
+                        page_sequence,
+                        f"CSV header + payload={csv_logical_size}, "
+                        f"logical_page_bytes={logical_page_bytes}",
+                    )
+
+            virtual_page = raw_logical_bytes.ljust(PAGE_SIZE, b"\xFF")
+            virtual_pages.append(
+                VirtualNandPage(
+                    data=virtual_page,
+                    physical_page_index=row["physical_page_index"],
+                )
+            )
+
+    print(
+        f"Loaded {len(virtual_pages)} BLE logical page(s) in ascending "
+        "page_sequence order."
+    )
+    return virtual_pages, stats
+
+
+def iter_usb_nand_pages(bin_filename: Path):
+    """Yield complete physical NAND pages exactly as the historical parser did."""
+    with bin_filename.open("rb") as bin_file:
+        physical_page_index = 0
+        while True:
+            page = bin_file.read(PAGE_SIZE)
+            if not page:
+                break
+            if len(page) != PAGE_SIZE:
+                print(
+                    f"Warning: incomplete final page at index {physical_page_index}; "
+                    f"length={len(page)}"
+                )
+                break
+            yield VirtualNandPage(page, physical_page_index)
+            physical_page_index += 1
+
+
 def parse_nand_dump(
     bin_filename: Path,
     imu_csv_filename: Path,
@@ -4154,6 +5029,7 @@ def parse_nand_dump(
     summary_filename: Path,
     light_raw_diagnostics_filename: Path,
     audio_sample_rate_hz: int,
+    ble_pages_csv_filename: Path | None = None,
 ):
     sensor_rows = []
     light_raw_rows = []
@@ -4166,18 +5042,18 @@ def parse_nand_dump(
     first_light_record_field_map = ""
     stats = ParseStats()
 
-    with open(bin_filename, "rb") as f:
-        physical_page_index = 0
-        while True:
-            page = f.read(PAGE_SIZE)
-            if not page:
-                break
-            if len(page) != PAGE_SIZE:
-                print(
-                    f"Warning: incomplete final page at index {physical_page_index}; "
-                    f"length={len(page)}"
-                )
-                break
+    ble_input_stats = None
+    if ble_pages_csv_filename is None:
+        input_pages = iter_usb_nand_pages(bin_filename)
+    else:
+        input_pages, ble_input_stats = load_ble_virtual_pages(
+            bin_filename=bin_filename,
+            csv_filename=ble_pages_csv_filename,
+        )
+
+    for input_page in input_pages:
+            page = input_page.data
+            physical_page_index = input_page.physical_page_index
 
             stats.total_pages += 1
             header = page[:PAGE_HEADER_SIZE]
@@ -4520,7 +5396,12 @@ def parse_nand_dump(
     stats.audio_complete_windows = len(complete_audio_windows)
     stats.audio_partial_windows = len(audio_window_rows) - len(complete_audio_windows)
 
-    audio_feature_df = pd.DataFrame(audio_feature_rows, columns=AUDIO_FEATURE_COLUMNS)
+    audio_feature_df, audio_feature_summary = analyze_audio_feature_dataframe(
+        pd.DataFrame(audio_feature_rows, columns=AUDIO_FEATURE_COLUMNS),
+        parser_invalid_records=stats.invalid_audio_feature_records,
+    )
+    for warning in audio_feature_summary["warnings"]:
+        print(f"Warning: {warning}")
     audio_window_df = pd.DataFrame(audio_window_rows, columns=AUDIO_WINDOW_COLUMNS)
     light_feature_df, light_feature_validation = validate_light_feature_records(
         light_feature_rows=light_feature_rows,
@@ -4570,6 +5451,9 @@ def parse_nand_dump(
     )
     audio_feature_comparison_report_filename = output_prefix.with_name(
         output_prefix.name + "_audio_feature_comparison.txt"
+    )
+    audio_feature_summary_report_filename = output_prefix.with_name(
+        output_prefix.name + "_audio_feature_summary.txt"
     )
     light_feature_csv_filename = output_prefix.with_name(
         output_prefix.name + "_light_feature_records.csv"
@@ -4631,6 +5515,14 @@ def parse_nand_dump(
         comparison_df=comparison_df,
         comparison_summary=comparison_summary,
     )
+    write_audio_feature_summary_report(
+        report_filename=audio_feature_summary_report_filename,
+        summary=audio_feature_summary,
+    )
+    audio_feature_plot_files = plot_audio_feature_records(
+        audio_feature_df=audio_feature_df,
+        output_prefix=output_prefix,
+    )
     write_light_feature_validation_report(
         report_filename=light_feature_validation_report_filename,
         stats=stats,
@@ -4650,8 +5542,27 @@ def parse_nand_dump(
         plots_state=plots_state,
     )
 
+    input_summary = ""
+    if ble_input_stats is not None:
+        input_summary = (
+            "Input source: BLE file\n"
+            f"BLE pages bin filename: {bin_filename.name}\n"
+            f"BLE pages CSV filename: {ble_pages_csv_filename.name}\n"
+            f"BLE logical pages: {ble_input_stats.logical_pages}\n"
+            f"BLE first page_sequence: {ble_input_stats.first_page_sequence}\n"
+            f"BLE last page_sequence: {ble_input_stats.last_page_sequence}\n"
+            "BLE first physical_page_index: "
+            f"{ble_input_stats.first_physical_page_index}\n"
+            "BLE last physical_page_index: "
+            f"{ble_input_stats.last_physical_page_index}\n"
+            f"BLE CRC mismatches: {ble_input_stats.crc_mismatches}\n"
+            f"BLE metadata mismatches: {ble_input_stats.metadata_mismatches}\n"
+            "BLE page order: page_sequence ascending (file_offset used for reads)\n\n"
+        )
+
     summary = (
-        f"Total pages: {stats.total_pages}\n"
+        input_summary
+        + f"Total pages: {stats.total_pages}\n"
         f"Sensor pages: {stats.sensor_pages}\n"
         f"Audio pages: {stats.audio_pages}\n"
         f"LRAW pages: {stats.light_raw_pages}\n"
@@ -4691,6 +5602,11 @@ def parse_nand_dump(
         f"AFEA CSV filename: {audio_feature_csv_filename.name}\n"
         f"AFEA comparison CSV filename: {audio_feature_comparison_csv_filename.name}\n"
         f"AFEA comparison report filename: {audio_feature_comparison_report_filename.name}\n"
+        f"AFEA summary report filename: {audio_feature_summary_report_filename.name}\n"
+        "AFEA plot filenames: "
+        f"{', '.join(path.name for path in audio_feature_plot_files) or 'None'}\n"
+        + "\n".join(_format_audio_feature_summary_lines(audio_feature_summary))
+        + "\n"
         "\nLight feature records\n"
         f"LFEA pages: {stats.light_feature_pages}\n"
         f"LFEA records: {stats.light_feature_records}\n"
@@ -4709,6 +5625,8 @@ def parse_nand_dump(
         f"{light_feature_validation['unexpected_timestamp_regressions']}\n"
         f"LFEA classification matches: {light_feature_validation['classification_matches']}\n"
         f"LFEA classification mismatches: {light_feature_validation['classification_mismatches']}\n"
+        "LFEA classification not evaluated: "
+        f"{light_feature_validation['classification_not_evaluated']}\n"
         f"LFEA flag mismatches: {light_feature_validation['flag_mismatches']}\n"
         f"AFEA/LFEA paired sequences: {compact_alignment_summary['paired_sequences']}\n"
         f"AFEA without LFEA: {compact_alignment_summary['afea_without_lfea']}\n"
@@ -4773,6 +5691,7 @@ def parse_nand_dump(
     print(f"Audio feature CSV saved to: {audio_feature_csv_filename}")
     print(f"Audio feature comparison CSV saved to: {audio_feature_comparison_csv_filename}")
     print(f"Audio feature comparison report saved to: {audio_feature_comparison_report_filename}")
+    print(f"Audio feature summary report saved to: {audio_feature_summary_report_filename}")
     print(f"Light feature CSV saved to: {light_feature_csv_filename}")
     print(f"Light feature validation report saved to: {light_feature_validation_report_filename}")
     print(f"Compact feature alignment CSV saved to: {compact_alignment_csv_filename}")
@@ -5428,6 +6347,15 @@ def run_internal_tests() -> None:
     assert parsed_audio_feature["environment_label"] == "NOISY"
     assert parsed_audio_feature["flag_complete"]
     assert parsed_audio_feature["flag_high_level"]
+    assert SOUND_ENVIRONMENT_THRESHOLDS_DBA == (35.0, 45.0, 55.0, 65.0, 75.0, 85.0)
+    for estimated_laeq, expected_class in (
+        (34.999, 0), (35.0, 1), (44.999, 1), (45.0, 2),
+        (54.999, 2), (55.0, 3), (64.999, 3), (65.0, 4),
+        (74.999, 4), (75.0, 5), (84.999, 5), (85.0, 6),
+    ):
+        assert classify_embedded_audio_environment(estimated_laeq) == expected_class
+    assert AUDIO_ENVIRONMENT_CLASS_NAMES[6] == "SOUND_HIGH_EXPOSURE"
+    assert AUDIO_ENVIRONMENT_CLASS_INTERVALS[1] == "35 <= Estimated LAeq < 45 dBA"
 
     second_audio_feature_record = struct.pack(
         AUDIO_FEATURE_RECORD_FORMAT,
@@ -5443,6 +6371,80 @@ def run_internal_tests() -> None:
         5,
         0x07,
     )
+    parsed_second_audio_feature = parse_audio_feature_record(second_audio_feature_record)
+
+    empty_afea_df, empty_afea_summary = analyze_audio_feature_dataframe(
+        pd.DataFrame(columns=AUDIO_FEATURE_COLUMNS)
+    )
+    assert empty_afea_df.empty
+    assert empty_afea_summary["valid_records"] == 0
+    with tempfile.TemporaryDirectory() as temp_dir:
+        assert plot_audio_feature_records(empty_afea_df, Path(temp_dir) / "zero") == []
+
+    zero_flag_audio_feature = dict(parsed_second_audio_feature)
+    zero_flag_audio_feature["flags"] = 0
+    for flag_column, _flag_label in AUDIO_FEATURE_FLAG_FIELDS:
+        zero_flag_audio_feature[flag_column] = False
+    one_afea_df, one_afea_summary = analyze_audio_feature_dataframe(
+        pd.DataFrame([zero_flag_audio_feature], columns=AUDIO_FEATURE_COLUMNS)
+    )
+    assert one_afea_summary["valid_records"] == 0
+    assert one_afea_summary["invalid_records"] == 1
+    assert one_afea_summary["detected_boot_sessions"] == 1
+    assert one_afea_summary["clipping_event_records"] == 0
+    assert one_afea_df["environment_class_name"].tolist() == ["SOUND_VERY_NOISY"]
+    assert one_afea_df["environment_class_range"].tolist() == ["75-85 dBA"]
+    assert one_afea_summary["environment_class_matches"] == 1
+    assert len(one_afea_summary["environment_class_distribution"]) == 7
+    with tempfile.TemporaryDirectory() as temp_dir:
+        one_plot_files = plot_audio_feature_records(one_afea_df, Path(temp_dir) / "one")
+        assert len(one_plot_files) == 4
+        assert all(path.is_file() for path in one_plot_files)
+
+    multi_afea_rows = []
+    for sequence, timestamp_ms in ((10, 1000), (11, 2000), (12, 500)):
+        row = dict(parsed_audio_feature)
+        row["window_sequence"] = sequence
+        row["window_start_ms"] = timestamp_ms
+        multi_afea_rows.append(row)
+    multi_afea_rows[1]["rms_a_dbfs"] = float("nan")
+    multi_afea_rows[1]["estimated_laeq_dba"] = float("nan")
+    multi_afea_df, multi_afea_summary = analyze_audio_feature_dataframe(
+        pd.DataFrame(multi_afea_rows, columns=AUDIO_FEATURE_COLUMNS),
+        parser_invalid_records=1,
+    )
+    assert multi_afea_df["boot_session"].tolist() == [0, 0, 1]
+    assert multi_afea_summary["recognized_timestamp_resets"] == 1
+    assert multi_afea_summary["invalid_records"] == 1
+    assert multi_afea_summary["clipping_event_records"] == 3
+    assert multi_afea_summary["feature_stats"]["rms_a_dbfs"]["finite_count"] == 2
+    with tempfile.TemporaryDirectory() as temp_dir:
+        multi_plot_files = plot_audio_feature_records(
+            multi_afea_df, Path(temp_dir) / "multi"
+        )
+        assert len(multi_plot_files) == 4
+        assert all(path.is_file() for path in multi_plot_files)
+
+    unknown_class_row = dict(parsed_audio_feature)
+    unknown_class_row["environment_class"] = 9
+    unknown_class_df, unknown_class_summary = analyze_audio_feature_dataframe(
+        pd.DataFrame([unknown_class_row], columns=AUDIO_FEATURE_COLUMNS)
+    )
+    assert unknown_class_df["environment_class_name"].tolist() == ["UNKNOWN_CLASS_9"]
+    assert unknown_class_df["environment_class_range"].tolist() == ["UNKNOWN"]
+    assert unknown_class_summary["unknown_environment_class_records"] == 1
+    assert unknown_class_summary["environment_class_not_evaluated"] == 1
+    assert unknown_class_summary["warnings"]
+
+    mismatched_class_row = dict(parsed_audio_feature)
+    mismatched_class_row["estimated_laeq_dba"] = 80.0
+    mismatched_class_df, mismatched_class_summary = analyze_audio_feature_dataframe(
+        pd.DataFrame([mismatched_class_row], columns=AUDIO_FEATURE_COLUMNS)
+    )
+    assert mismatched_class_df["python_environment_class"].tolist() == [5]
+    assert mismatched_class_df["environment_class_match"].tolist() == [False]
+    assert mismatched_class_summary["environment_class_mismatches"] == 1
+
     afea_page = _make_test_page(
         magic=MAGIC_AUDIO_FEATURE,
         payload=audio_feature_record + second_audio_feature_record,
@@ -5566,6 +6568,55 @@ def run_internal_tests() -> None:
     assert reboot_validation["non_monotonic_timestamps_within_sessions"] == 0
     assert reboot_validation["unexpected_timestamp_regressions"] == 0
     assert reboot_validation["final_result"] == "PASS"
+
+    def make_hysteresis_test_record(
+        sequence: int,
+        timestamp_ms: int,
+        clear_counts: int,
+        exposure_class: int,
+    ) -> dict:
+        record = bytearray(light_feature_record)
+        struct.pack_into("<I", record, 0, sequence)
+        struct.pack_into("<I", record, 4, timestamp_ms)
+        struct.pack_into("<H", record, 24, clear_counts)
+        record[28] = exposure_class
+        return parse_light_feature_record(bytes(record))
+
+    hysteresis_session_df, hysteresis_session_validation = (
+        validate_light_feature_records(
+            [
+                make_hysteresis_test_record(1, 1000, 2, 1),
+                make_hysteresis_test_record(2, 2000, 3, 1),
+                make_hysteresis_test_record(3, 3000, 2, 1),
+                make_hysteresis_test_record(4, 500, 2, 1),
+                make_hysteresis_test_record(5, 1500, 0, 0),
+            ],
+            ParseStats(),
+        )
+    )
+    assert hysteresis_session_df["boot_session"].tolist() == [0, 0, 0, 1, 1]
+    assert hysteresis_session_df["classification_evaluated"].tolist() == [
+        False, True, True, False, True,
+    ]
+    assert hysteresis_session_df["python_exposure_class"].isna().tolist() == [
+        True, False, False, True, False,
+    ]
+    assert hysteresis_session_df["python_exposure_class"].fillna(-1).tolist() == [
+        -1, 1, 1, -1, 0,
+    ]
+    assert hysteresis_session_validation["classification_matches"] == 3
+    assert hysteresis_session_validation["classification_mismatches"] == 0
+    assert hysteresis_session_validation["classification_not_evaluated"] == 2
+    assert hysteresis_session_validation["final_result"] == "PASS"
+
+    _, all_unknown_validation = validate_light_feature_records(
+        [make_hysteresis_test_record(1, 1000, 2, 1)],
+        ParseStats(),
+    )
+    assert all_unknown_validation["classification_matches"] == 0
+    assert all_unknown_validation["classification_mismatches"] == 0
+    assert all_unknown_validation["classification_not_evaluated"] == 1
+    assert all_unknown_validation["final_result"] == "NOT AVAILABLE"
 
     unexpected_record_before = bytearray(light_feature_record)
     struct.pack_into("<I", unexpected_record_before, 4, 20000)
@@ -5853,9 +6904,22 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Analyze an existing NAND dump without opening the serial GUI.",
     )
     parser.add_argument(
+        "--ble-pages-bin",
+        type=Path,
+        help="BLE logical page binary produced by ble_sync_client.py.",
+    )
+    parser.add_argument(
+        "--ble-pages-csv",
+        type=Path,
+        help="BLE page metadata CSV produced by ble_sync_client.py.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
-        help="Output directory for --dump mode; defaults to the dump directory.",
+        help=(
+            "Output directory for --dump or BLE file mode; defaults to the "
+            "input binary directory."
+        ),
     )
     parser.add_argument(
         "--audio-sample-rate",
@@ -5872,13 +6936,38 @@ def _build_cli_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    args = _build_cli_parser().parse_args(argv)
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
     if args.run_internal_tests:
         run_internal_tests()
         return
 
-    offline_mode = args.dump is not None
-    if offline_mode:
+    ble_mode = args.ble_pages_bin is not None or args.ble_pages_csv is not None
+    if (args.ble_pages_bin is None) != (args.ble_pages_csv is None):
+        parser.error("--ble-pages-bin and --ble-pages-csv must be provided together")
+    if args.dump is not None and ble_mode:
+        parser.error("--dump cannot be combined with BLE page input arguments")
+
+    offline_mode = args.dump is not None or ble_mode
+    ble_pages_csv_filename = None
+    if ble_mode:
+        bin_filename = args.ble_pages_bin.expanduser().resolve()
+        ble_pages_csv_filename = args.ble_pages_csv.expanduser().resolve()
+        if not bin_filename.is_file():
+            print(f"Processing error: BLE pages binary not found: {bin_filename}")
+            return
+        if not ble_pages_csv_filename.is_file():
+            print(f"Processing error: BLE pages CSV not found: {ble_pages_csv_filename}")
+            return
+        save_folder = (
+            args.output_dir.expanduser().resolve()
+            if args.output_dir is not None
+            else bin_filename.parent
+        )
+        save_folder.mkdir(parents=True, exist_ok=True)
+        output_prefix = save_folder / bin_filename.stem
+        audio_sample_rate = args.audio_sample_rate
+    elif args.dump is not None:
         bin_filename = args.dump.expanduser().resolve()
         if not bin_filename.is_file():
             print(f"Processing error: dump file not found: {bin_filename}")
@@ -5945,6 +7034,7 @@ def main(argv=None):
             summary_filename=summary_filename,
             light_raw_diagnostics_filename=light_raw_diagnostics_filename,
             audio_sample_rate_hz=audio_sample_rate,
+            ble_pages_csv_filename=ble_pages_csv_filename,
         )
 
         plot_imu_data(imu_df, output_prefix)

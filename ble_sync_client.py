@@ -359,6 +359,7 @@ class BleSyncClient:
         self.current_page: Optional[PageContext] = None
         self.pages_saved = 0
         self.finished = asyncio.Event()
+        self.stop_requested = False
         self.page_records: list[dict[str, object]] = []
         self.output_file = None
 
@@ -409,6 +410,18 @@ class BleSyncClient:
 
     async def handle_frame(self, frame: Frame) -> None:
         name = MESSAGE_NAMES.get(frame.msg_type, "UNKNOWN")
+
+        if self.stop_requested and frame.msg_type not in (
+            BLE_MSG_SYNC_COMPLETE,
+            BLE_MSG_SYNC_ABORT,
+            BLE_MSG_ERROR,
+        ):
+            print(
+                f"[RX-IGNORED] seq={frame.seq} type=0x{frame.msg_type:02X} {name} "
+                "because max-pages was already reached"
+            )
+            return
+
         print(
             f"[RX] seq={frame.seq} type=0x{frame.msg_type:02X} {name} "
             f"payload={len(frame.payload)} bytes"
@@ -420,6 +433,12 @@ class BleSyncClient:
                 self.print_status(self.status)
 
             elif frame.msg_type == BLE_MSG_PAGE_BEGIN:
+                if self.max_pages is not None and self.pages_saved >= self.max_pages:
+                    self.stop_requested = True
+                    self.finished.set()
+                    print("[STOP] Ignoring PAGE_BEGIN because max-pages was already reached")
+                    return
+
                 page = parse_page_begin(frame.payload)
                 self.current_page = page
                 print(
@@ -555,6 +574,7 @@ class BleSyncClient:
         self.current_page = None
 
         if self.max_pages is not None and self.pages_saved >= self.max_pages:
+            self.stop_requested = True
             print(f"[STOP] Reached max pages: {self.max_pages}")
             self.finished.set()
 
@@ -612,6 +632,8 @@ class BleSyncClient:
 
                 try:
                     await asyncio.wait_for(self.finished.wait(), timeout=600.0)
+                    if self.stop_requested:
+                        await asyncio.sleep(0.2)
                 except asyncio.TimeoutError:
                     print("[TIMEOUT] Client timeout reached")
 
@@ -701,4 +723,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -70,9 +70,9 @@ AUDIO_FEATURE_RECORD_VERSION = 1
 AUDIO_FEATURE_RECORD_SIZE = 24
 AUDIO_FEATURE_RECORD_FORMAT = "<IIHhhhhhHBB"
 AUDIO_DB_CENTI_INVALID = -32768
-AUDIO_WINDOW_SAMPLES = 24000
+AUDIO_WINDOW_SAMPLES = 48000
 AUDIO_WINDOW_BYTES = AUDIO_WINDOW_SAMPLES * 2
-AUDIO_WINDOW_EXPECTED_PAYLOAD_PATTERN = (2048,) * 23 + (896,)
+AUDIO_WINDOW_EXPECTED_PAYLOAD_PATTERN = (2048,) * 46 + (1792,)
 AUDIO_FEATURE_DB_TOLERANCE_DB = 0.02
 AUDIO_FEATURE_MEAN_TOLERANCE_COUNTS = 0
 
@@ -3547,7 +3547,7 @@ def reconstruct_audio_windows(audio_pages: list[dict]) -> tuple[list[dict], list
             complete_windows.append(internal_window)
         elif exact_size:
             warnings.append(
-                f"AUD0 window {window_index} has 48000 bytes but unexpected "
+                f"AUD0 window {window_index} has {AUDIO_WINDOW_BYTES} bytes but unexpected "
                 f"payload pattern: {row['payload_pattern']}"
             )
         else:

@@ -1,5 +1,5 @@
 import numpy as np
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 import serial
 import os
 import pandas as pd
@@ -63,6 +63,7 @@ def process_bin_file(bin_filename, csv_filename=None):
     clear_list, nir_list = [], []
     mains_hz_list = []
     mains_category_list = []
+    step_count_list =[]
 
     with open(bin_filename, "rb") as f:
         while True:
@@ -140,6 +141,8 @@ def process_bin_file(bin_filename, csv_filename=None):
                     mains_category_list.append("60 Hz mains")
                 else:
                     mains_category_list.append("no mains / natural or DC")
+                
+                step_count_list.append(subpkt[39])
 
     df = pd.DataFrame({
         "hh": hh_list,
@@ -164,6 +167,7 @@ def process_bin_file(bin_filename, csv_filename=None):
         "nir": nir_list,
         "mains_hz": mains_hz_list,
         "mains_category": mains_category_list,
+        "step_count": step_count_list,
     })
 
     # ---- Visualization ----
@@ -182,8 +186,9 @@ def process_bin_file(bin_filename, csv_filename=None):
     # 11: F8
     # 12: NIR
     # 13: mains category
-    fig, axes = plt.subplots(14, 1, figsize=(15, 26), sharex=True)
 
+    """
+    fig, axes = plt.subplots(14, 1, figsize=(15, 26), sharex=True)
     # Accelerometer (one axis per subplot row)
     axes[0].plot(df.index, df["acc_x"], label = "acc_x")
     axes[0].plot(df.index, df["acc_y"], label = "acc_y")
@@ -265,7 +270,7 @@ def process_bin_file(bin_filename, csv_filename=None):
 
     plt.tight_layout()
     plt.show()
-
+    """
     if csv_filename:
         df.to_csv(csv_filename, index=False)
         print(f"📄 Data saved in CSV: {csv_filename}")
